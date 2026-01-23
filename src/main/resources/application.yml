@@ -1,0 +1,8 @@
+server:
+  port: 18080
+
+
+# 日志配置
+logging:
+  level:
+    io.github.mymonstercat.*: debug
