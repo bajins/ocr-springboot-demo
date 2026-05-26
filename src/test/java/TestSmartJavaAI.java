@@ -43,21 +43,22 @@ public class TestSmartJavaAI {
     public static void main(String[] args) {
         String path = "";
         try {
-            URL url = Thread.currentThread().getContextClassLoader().getResource("images/17615436349877.png");
+            URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
             if (url == null) {
                 throw new IllegalArgumentException("未找到资源");
             }
             // 自动处理编码、特殊字符
             URI uri = url.toURI();
-            path = ImageCropAndRotate.processImage(Paths.get(uri).toString());
+            path = Paths.get(uri).toString();
+           /* path = ImageCropAndRotate.processImage(Paths.get(uri).toString());
         } catch (IOException e) {
-            e.printStackTrace();
+            e.printStackTrace();*/
         } catch (URISyntaxException e) {
             e.printStackTrace();
         }
         try {
             OcrInfo ocrInfo = recognize2(getProRecModel(), path);
-            log.info("OCR识别结果：{}\nfullText：{}", JsonUtils.toJson(ocrInfo), ocrInfo.getFullText().replaceAll("[^a-zA-Z0-9]", ""));
+            log.info("OCR识别结果：{}\nfullText：{}", JsonUtils.toJson(ocrInfo), ocrInfo.getFullText());
         } catch (IOException e) {
             e.printStackTrace();
         }

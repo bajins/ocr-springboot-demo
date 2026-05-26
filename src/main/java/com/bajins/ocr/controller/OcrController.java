@@ -20,6 +20,7 @@ import java.util.regex.Pattern;
 
 /**
  * OCR识别控制器
+ *
  * @author bajins.com
  */
 @RestController
@@ -44,7 +45,7 @@ public class OcrController {
 
         String path;
         try {
-            URL url = Thread.currentThread().getContextClassLoader().getResource("images/17615436349877.png");
+            URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
             if (url == null) {
                 throw new IllegalArgumentException("未找到资源");
             }
@@ -99,5 +100,10 @@ public class OcrController {
             return matcher.group();
         }
         return "未识别到ICCID码，文字读取结果：" + ocrResult.getStrRes();
+    }
+
+    public static void main(String[] args) {
+        String ocr = new OcrController().ocr();
+        System.out.println(ocr);
     }
 }

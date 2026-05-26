@@ -1,64 +1,77 @@
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sun.jna.Native;
-import com.sun.jna.NativeLibrary;
+import com.sun.jna.*;
 import com.sun.jna.win32.StdCallLibrary;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Scanner;
 
+// https://github.com/PaddleOCRCore/PaddleOCRApi
 public class TestPaddleOCRApi {
 
     /**
      * PaddleOCR.dll C++接口
-     *
-     * 需要引入 JNA 库 (jna-jpms.jar 和 jna-platform-jpms.jar)
+     * <p>
+     * 以下dll文件为必须
+     * mkldnn.dll
+     * mklml.dll
+     * paddle_inference.dll
+     * PaddleOCR.dll
+     * phi.dll
+     * common.dll
+     * libiomp5md.dll
      */
     // 定义 DLL 接口，对应 PaddleOCR.dll 中的导出函数
     public interface PaddleOCR extends StdCallLibrary {
         // 加载 PaddleOCR.dll
-        PaddleOCR INSTANCE = Native.load(getLibraryName(), PaddleOCR.class);
+        PaddleOCR INSTANCE = loadLibrary(null, PaddleOCR.class);
 
-        static String getLibraryName() {
+        static <T extends Library> T loadLibrary(String libDir, Class<T> clazz) {
+            String libName = "win32-x86-64/";
+            if (Platform.isMac()) {
+                libName += "PaddleOCR.dylib";
+            } else if (Platform.isLinux()) {
+                libName += "PaddleOCR.so";
+            } else if (Platform.isWindows()) {
+                libName += "PaddleOCR.dll";
+            } else {
+                throw new RuntimeException("Unsupported platform: " + System.getProperty("os.name"));
+            }
             File dll;
-            try {
-                dll = Native.extractFromResourcePath("win32-x86-64/PaddleOCR.dll");
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+            if (libDir != null && !libDir.isEmpty() && Files.exists(Paths.get(libDir))) {
+                Path path = Paths.get(libDir);
+                if (!Files.isDirectory(path)) {
+                    path = path.getParent();
+                }
+                dll = path.resolve(libName).toFile();
+            } else {
+                try {
+                    dll = Native.extractFromResourcePath(libName);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
             }
             // 为关键库设置专用路径
             // NativeLibrary.addSearchPath("PaddleOCR", dll.getParent());
             // Windows设置多个库路径，用分号分隔
             System.setProperty("jna.library.path", dll.getParent());
-            return "PaddleOCR";
-            // Linux使用冒号分隔多个路径
-            // System.setProperty("jna.library.path", "/usr/local/lib:/opt/custom/libs");
-
-            // 启用调试模式可以查看JNA的完整搜索过程
-            // System.setProperty("jna.debug_load", "true");
-
-            // 从 resources/native/win64/PaddleOCR.dll 加载
-            /*InputStream in = YourClass.class.getResourceAsStream("/native/win64/PaddleOCR.dll");
-            File tempDll = File.createTempFile("PaddleOCR-", ".dll");
-            try (FileOutputStream out = new FileOutputStream(tempDll)) {
-               in.transferTo(out);
+            if (Platform.isWindows()) {
+                // 设置 Windows DLL 搜索目录（处理依赖）用 Kernel32.SetDllDirectory 扩展搜索路径（Win32 API）
+                // 需要 JNA 的 platform.jar
+                //com.sun.jna.platform.win32.Kernel32.INSTANCE.SetDllDirectory(dll.getParent());
+                NativeLibrary.getInstance("kernel32")
+                        .getFunction("SetDllDirectoryA")
+                        .invokeInt(new Object[]{dll.getParent()});
             }
-            tempDll.deleteOnExit();*/
-
-            // 判断系统架构引入PaddleOCR.dll或PaddleOCR.lib
-            /*String osName = System.getProperty("os.name").toLowerCase();
-            if (osName.contains("win")) {
-                return "PaddleOCR.dll";
-            } else if (osName.contains("mac")) {
-                return "libPaddleOCR.dylib";
-            } else if (osName.contains("linux")) {
-                return "libPaddleOCR.so";
-            } else {
-                throw new RuntimeException("Unsupported operating system: " + osName);
-            }*/
-            // boolean IS_64BIT = System.getProperty("os.arch").contains("64");
+            // 在加载 DLL 前，动态添加路径到 java.library.path
+        /*String libraryPath = System.getProperty("java.library.path");
+        System.setProperty("java.library.path", dll.getParent() + File.pathSeparator + libraryPath);*/
+            return Native.load(dll.getAbsolutePath(), clazz);
         }
 
         // 开启/关闭日志
@@ -68,10 +81,13 @@ public class TestPaddleOCRApi {
         void EnableJsonResult(boolean enable);
 
         // 初始化引擎 (JSON 配置方式)
-        boolean Initjson(String det_infer, String cls_infer, String rec_infer, String keys, String parameterjson);
+        boolean Initjson(String det_infer, String cls_infer, String rec_infer, String parameterjson);
 
         // 识别图片
-        String Detect(String imageFile);
+        Pointer Detect(String imageFile);
+
+        // 释放 Detect 返回的结果缓冲区
+        void FreeResultBuffer(Pointer resultPtr);
 
         // 释放引擎
         void FreeEngine();
@@ -83,10 +99,9 @@ public class TestPaddleOCRApi {
             String rootDir = System.getProperty("user.dir");
 
             // 模型路径 (请根据实际存放位置修改)
-            String detModel = rootDir + "\\models\\PP-OCRv5_mobile_det_infer";
-            String clsModel = rootDir + "\\models\\PP-LCNet_x1_0_textline_ori";
-            String recModel = rootDir + "\\models\\PP-OCRv5_mobile_rec_infer";
-            String keysPath = rootDir + "\\models\\ppocr_keys.txt";
+            String detModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-OCRv5_server_det_infer";
+            String clsModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-LCNet_x1_0_textline_ori_infer";
+            String recModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-OCRv5_server_rec_infer";
 
             // 初始化参数 JSON
             Map<String, Object> ocrParameter = getOCRParameter();
@@ -98,8 +113,10 @@ public class TestPaddleOCRApi {
             System.out.println("=== PaddleOCR Java Demo ===");
             System.out.println("正在初始化 OCR 引擎...");
 
+            PaddleOCR.INSTANCE.EnableLog(false);
+
             // 初始化
-            boolean inited = PaddleOCR.INSTANCE.Initjson(detModel, clsModel, recModel, keysPath, configJson);
+            boolean inited = PaddleOCR.INSTANCE.Initjson(detModel, clsModel, recModel, configJson);
 
             if (!inited) {
                 System.err.println("OCR 初始化失败！请确认以下事项：");
@@ -111,8 +128,17 @@ public class TestPaddleOCRApi {
             // 设置返回格式为纯文本
             PaddleOCR.INSTANCE.EnableJsonResult(false);
 
+            // 执行 OCR 识别
+            Pointer resultPtr = PaddleOCR.INSTANCE.Detect("F:\\workspace\\workspace-a\\2026-05-05_163050.png");
+            String result = "";
+            if (resultPtr != null) {
+                result = resultPtr.getString(0, "UTF-8");
+                PaddleOCR.INSTANCE.FreeResultBuffer(resultPtr);
+            }
+            System.out.println("识别内容: \n" + result);
+
             // 遍历 images 目录下的图片
-            File imageDir = new File(rootDir + "\\images");
+            /*File imageDir = new File("target/classes/images");
             if (imageDir.exists() && imageDir.isDirectory()) {
                 File[] images = imageDir.listFiles((dir, name) -> {
                     String lower = name.toLowerCase();
@@ -125,7 +151,12 @@ public class TestPaddleOCRApi {
                         long startTime = System.currentTimeMillis();
 
                         // 执行 OCR 识别
-                        String result = PaddleOCR.INSTANCE.Detect(img.getAbsolutePath());
+                        Pointer resultPtr = PaddleOCR.INSTANCE.Detect(img.getAbsolutePath());
+                        String result = "";
+                        if (resultPtr != null) {
+                            result = resultPtr.getString(0, "UTF-8");
+                            PaddleOCR.INSTANCE.FreeResultBuffer(resultPtr);
+                        }
 
                         long endTime = System.currentTimeMillis();
                         System.out.println("OCR 耗时: " + (endTime - startTime) + "ms");
@@ -139,7 +170,7 @@ public class TestPaddleOCRApi {
             }
 
             System.out.println("\n程序运行完毕，按回车键退出...");
-            new Scanner(System.in).nextLine();
+            new Scanner(System.in).nextLine();*/
 
             // 释放引擎
             // PaddleOCR.INSTANCE.FreeEngine();
@@ -155,7 +186,7 @@ public class TestPaddleOCRApi {
 
     /**
      * PaddleOCR.dll C++识别参数 (对应 struct OCRParameter)
-     *
+     * <p>
      * https://github.com/PaddleOCRCore/PaddleOCRApi/blob/main/Demo/CPP/include/AI_Parameter.h
      */
     public static Map<String, Object> getOCRParameter() {

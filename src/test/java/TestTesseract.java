@@ -29,15 +29,16 @@ public class TestTesseract {
     public static void main(String[] args) throws URISyntaxException {
         String path = "";
         try {
-            URL url = Thread.currentThread().getContextClassLoader().getResource("images/17615436349877.png");
+            URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
             if (url == null) {
                 throw new IllegalArgumentException("未找到资源");
             }
             // 自动处理编码、特殊字符
             URI uri = url.toURI();
-            path = ImageCropAndRotate.processImage(Paths.get(uri).toString());
+            path = Paths.get(uri).toString();
+           /* path = ImageCropAndRotate.processImage(Paths.get(uri).toString());
         } catch (IOException e) {
-            e.printStackTrace();
+            e.printStackTrace();*/
         } catch (URISyntaxException e) {
             e.printStackTrace();
         }
