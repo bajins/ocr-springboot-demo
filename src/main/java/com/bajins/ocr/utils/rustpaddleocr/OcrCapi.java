@@ -2,70 +2,22 @@ package com.bajins.ocr.utils.rustpaddleocr;
 
 import com.sun.jna.*;
 
-import java.io.File;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.List;
-
 
 /**
+ * rust-paddle-ocr C API 的 JNA 绑定。
+ * <p>
+ * 仅声明原生结构体与函数映射，库加载逻辑见 {@link OcrNativeLibrary}。
+ * <p>
  * https://github.com/zibo-chen/paddle-ocr-capi/blob/master/include/ocr_capi.h
  */
 public interface OcrCapi extends Library {
-    // 加载名为 ocr_capi 的动态库（Windows加载 ocr_capi.dll，macOS为 libocr_capi.dylib，Linux为 libocr_capi.so）
-    OcrCapi INSTANCE = loadLibrary(null, OcrCapi.class);
 
     /**
-     * 加载 OCR 动态库
-     * <p>
-     * https://github.com/zibo-chen/paddle-ocr-capi/releases
+     * 单例绑定实例，启动时从资源路径加载原生库。
+     * 库不在资源路径时抛出 {@link OcrException}（触发 {@link ExceptionInInitializerError}）。
      */
-    static <T extends Library> T loadLibrary(String libDir, Class<T> clazz) {
-        String libName = "rustpaddleocr/";
-        if (Platform.isMac()) {
-            libName += "libocr_capi.dylib";
-        } else if (Platform.isLinux()) {
-            libName += "libocr_capi.so";
-        } else if (Platform.isWindows()) {
-            libName += "ocr_capi-windows-x64.dll";
-        } else {
-            throw new RuntimeException("Unsupported platform: " + System.getProperty("os.name"));
-        }
-        File dll;
-        if (libDir != null && !libDir.isEmpty() && Files.exists(Paths.get(libDir))) {
-            Path path = Paths.get(libDir);
-            if (!Files.isDirectory(path)) {
-                path = path.getParent();
-            }
-            dll = path.resolve(libName).toFile();
-        } else {
-            try {
-                dll = Native.extractFromResourcePath(libName);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }
-        // 为关键库设置专用路径
-        // NativeLibrary.addSearchPath("PaddleOCR", dll.getParent());
-        // Windows设置多个库路径，用分号分隔
-        System.setProperty("jna.library.path", dll.getParent());
-        if (Platform.isWindows()) {
-            // 设置 Windows DLL 搜索目录（处理依赖）用 Kernel32.SetDllDirectory 扩展搜索路径（Win32 API）
-            // 需要 JNA 的 platform.jar
-            //com.sun.jna.platform.win32.Kernel32.INSTANCE.SetDllDirectory(dll.getParent());
-            NativeLibrary.getInstance("kernel32")
-                    .getFunction("SetDllDirectoryA")
-                    .invokeInt(new Object[]{dll.getParent()});
-        }
-        // 在加载 DLL 前，动态添加路径到 java.library.path
-        /*String libraryPath = System.getProperty("java.library.path");
-        System.setProperty("java.library.path", dll.getParent() + File.pathSeparator + libraryPath);*/
-        return Native.load(dll.getAbsolutePath(), clazz);
-    }
+    OcrCapi INSTANCE = OcrNativeLibrary.load(null, OcrCapi.class);
 
     // ==========================================
     // 适配 C 语言 size_t 的跨平台包装类
@@ -212,7 +164,7 @@ public interface OcrCapi extends Library {
 
 
     // ==========================================
-    // C API 函数映射 (Functions)
+    // 3. C API 函数映射 (Functions)
     // ==========================================
 
     // 配置初始化函数 (按值返回 ByValue)
@@ -228,41 +180,30 @@ public interface OcrCapi extends Library {
 
     String ocr_version();
 
-    // 引擎创建与销毁 (Opaque 句柄在 Java 中统一使用 Pointer 表达)
+    // 引擎创建与销毁 (config 传 OcrConfig.ByValue，由 PaddleOcrEngine.Config.toNative() 构造)
     OcrEngineHandle ocr_engine_create(String det_path, String rec_path, String keys_path, OcrConfig config);
 
     OcrEngineHandle ocr_engine_create_with_ori(String det_path, String rec_path, String keys_path, String ori_path, OcrConfig config);
 
-    // config 传 Pointer.NULL 可使用默认配置
-    OcrEngineHandle ocr_engine_create(String det_model, String rec_model, String keys_file, Pointer config);
-
     void ocr_engine_destroy(OcrEngineHandle engine);
 
-    void ocr_engine_destroy(Pointer engine);
-
     // 高级识别 API (按值返回 ResultList)
-    OcrResultList.ByValue ocr_engine_recognize_file(Pointer engine, String file_path);
-
     OcrResultList.ByValue ocr_engine_recognize_file(OcrEngineHandle engine, String path);
 
-    OcrResultList.ByValue ocr_engine_recognize_rgb(Pointer engine, byte[] rgb_data, int width, int height);
-
-    OcrResultList.ByValue ocr_engine_recognize_rgba(Pointer engine, byte[] rgba_data, int width, int height);
-
-    // 使用 byte[] 直接传递图像内存数据
-    OcrResultList.ByValue ocr_engine_recognize_rgb(OcrEngineHandle engine, byte[] rgb_data, long width, long height);
-
-    OcrResultList.ByValue ocr_engine_recognize_rgba(OcrEngineHandle engine, byte[] rgba_data, long width, long height);
-
-    // 优化：使用 ByteBuffer 替代 byte[] 实现零拷贝
+    // 零拷贝识别 RGB 图像数据（ByteBuffer 必须为 Direct）
     OcrResultList.ByValue ocr_engine_recognize_rgb(OcrEngineHandle handle, ByteBuffer rgb_data, int width, int height);
 
+    // 零拷贝识别 RGBA 图像数据（ByteBuffer 必须为 Direct）
     OcrResultList.ByValue ocr_engine_recognize_rgba(OcrEngineHandle handle, ByteBuffer rgba_data, int width, int height);
 
     // 释放结果内存 (C函数要求传入 &result 指针，通过 JNA 的 Pointer 传递)
     void ocr_result_list_free(Pointer result);
 
+    // 显式内存释放（传入的是结构体指针，对应 Java 的普通 Structure 对象）
+    void ocr_result_list_free(OcrResultList result); // JNA 自动传递结构体指针
 
+
+    /// ---------------------------
     // Ori 方向分类模型 API
     OriModelHandle ocr_ori_model_create(String model_path, OcrConfig config);
 
@@ -270,12 +211,8 @@ public interface OcrCapi extends Library {
 
     OriResult.ByValue ocr_ori_model_classify_file(OriModelHandle handle, String image_path);
 
-    // 显式内存释放（传入的是结构体指针，对应 Java 的普通 Structure 对象）
-    void ocr_result_list_free(OcrResultList result); // JNA 自动传递结构体指针
-
     /// ---------------------------
-
-    // 创建检测模型
+    // 底层检测模型 API
     Pointer ocr_det_model_create(String det_path, OcrConfig config);
 
     /**
