@@ -1,7 +1,6 @@
 import com.bajins.ocr.utils.rustpaddleocr.*;
 
 
-import java.awt.*;
 import java.nio.ByteBuffer;
 import java.util.List;
 
@@ -12,19 +11,30 @@ import java.util.List;
  * https://github.com/zibo-chen/paddle-ocr-capi
  * https://github.com/zibo-chen/rust-paddle-ocr
  */
-public class RustPaddleOcrExample {
+public class RustPaddleOcr {
 
     public static void main(String[] args) {
         System.out.println("PaddleOCR 库版本: " + PaddleOcrEngine.getVersion());
 
         // 1. 初始化快速 GPU 引擎配置（如果是 Mac 自动走 Metal，Windows 自动走 OpenCL）
-        PaddleOcrEngine.Config config = PaddleOcrEngine.Config.gpu();
+//        PaddleOcrEngine.Config config = PaddleOcrEngine.Config.gpu();
+        PaddleOcrEngine.Config config = PaddleOcrEngine.Config.defaultConf();
 
-        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv5_mobile_det.mnn";
-//        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ch_PP-OCRv5_det_server.mnn";
-        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv5_mobile_rec.mnn";
-//        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ch_PP-OCRv5_rec_server.mnn";
-        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v5.txt";
+//        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_tiny_det.mnn"; // 轻量 v6 档位；不支持日文
+        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_small_det.mnn"; // 平衡 v6 档位
+//        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_medium_det.mnn"; // 准确率优先 v6 档位
+//        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv5_mobile_det.mnn";
+//        String detModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ch_PP-OCRv4_det_infer.mnn";
+//        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_tiny_rec.mnn";
+        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_small_rec.mnn";
+//        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv6_medium_rec.mnn";
+//        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-OCRv5_mobile_rec.mnn";
+//        String recModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ch_PP-OCRv4_rec_infer.mnn";
+//        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v6_tiny.txt";
+        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v6_small.txt";
+//        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v6_medium.txt";
+//        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v5.txt";
+//        String keysFile = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ppocr_keys_v4.txt";
         String oriModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\PP-LCNet_x1_0_doc_ori.mnn";
 //        String oriModel = "F:\\workspace\\workspace-a\\rust-paddle-ocr\\models\\ch_PP-LCNet_x1_0_textline_ori_cls_server.mnn";
         String testImg = "F:\\workspace\\workspace-a\\2026-05-05_163050.png";

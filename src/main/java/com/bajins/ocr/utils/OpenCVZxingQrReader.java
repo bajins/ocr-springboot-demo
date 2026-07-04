@@ -11,7 +11,6 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.CLAHE;
 import org.opencv.imgproc.Imgproc;
 
-import javax.imageio.ImageIO;
 import java.awt.geom.AffineTransform;
 import java.awt.image.AffineTransformOp;
 import java.awt.image.BufferedImage;
@@ -47,7 +46,7 @@ import java.util.*;
  * | **透视变换**     | `getPerspectiveTransform` + `warpPerspective` | 将倾斜标签拉平为正视矩形              |
  * | **Fallback** | 如果找不到四边形，返回 `null`，后续策略继续尝试原始图                | 兼容无倾斜或轮廓不清的标签             |
  */
-public class OpenCVZxingEnhancedScanner implements AutoCloseable {
+public class OpenCVZxingQrReader implements AutoCloseable {
 
     static {
         // 自动加载对应平台的 OpenCV 原生库（无需系统安装）
@@ -57,7 +56,7 @@ public class OpenCVZxingEnhancedScanner implements AutoCloseable {
     private final MultipleBarcodeReader multiReader;
     private final Map<DecodeHintType, Object> hints;
 
-    public OpenCVZxingEnhancedScanner() {
+    public OpenCVZxingQrReader() {
         MultiFormatReader formatReader = new MultiFormatReader();
         multiReader = new GenericMultipleBarcodeReader(formatReader);
 
@@ -114,81 +113,114 @@ public class OpenCVZxingEnhancedScanner implements AutoCloseable {
     private List<BarcodeResult> scanInternal(Mat original) {
         List<BarcodeResult> allResults = new ArrayList<>();
 
-        // 统一转灰度（所有策略的输入）
+        // 统一转灰度(所有策略的输入)
         Mat gray = new Mat();
-        if (original.channels() == 3 || original.channels() == 4) {
-            Imgproc.cvtColor(original, gray, Imgproc.COLOR_BGR2GRAY);
-        } else {
-            original.copyTo(gray);
+        try {
+            if (original.channels() == 3 || original.channels() == 4) {
+                Imgproc.cvtColor(original, gray, Imgproc.COLOR_BGR2GRAY);
+            } else {
+                original.copyTo(gray);
+            }
+
+            /*
+             * 策略按"轻→重"排序,典型标签在前几个轻量策略即可命中,命中后早停避免重策略。
+             * 早停:已识别到码 且 连续 EMPTY_LIMIT 个策略无新增 → 跳过后续重策略(透视矫正/放大)。
+             * 若一个码都没识别到(allResults 为空),即使连续无新增也继续尝试后续救命策略,
+             * 避免倾斜/极小标签因前几个增强策略未命中而被漏识。
+             */
+            final int emptyLimit = 2;
+            int consecutiveEmpty = 0;
+            int added;
+
+            // 策略 1:原始灰度(最轻,直接解码)
+            added = runStrategy(gray, "original", null, allResults);
+            consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+
+            // 策略 2:标准预处理(去噪+CLAHE+自适应阈值+锐化;适用模糊/低对比度/轻微反光)
+            if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                added = runStrategy(gray, "standard", standardPreprocess(gray), allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+
+            // 策略 3:OTSU 全局阈值(适用光照不均/阴影/强反光)
+            if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                added = runStrategy(gray, "otsu", otsuPreprocess(gray), allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+
+            // 策略 4:高锐化(适用运动模糊/打印质量差/边缘虚化)
+            if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                added = runStrategy(gray, "sharpen", sharpenPreprocess(gray), allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+
+            // 策略 5:颜色反转(适用反光导致白底黑条变黑底白条)
+            if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                Mat inverted = new Mat();
+                Core.bitwise_not(gray, inverted);
+                added = runStrategy(gray, "inverted", inverted, allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+
+            // 策略 6:透视矫正 + 标准预处理 + 矫正后直接识别(重,置后;解决拍摄倾斜)
+            if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                Mat warped = perspectiveCorrect(gray);
+                if (warped != null && !warped.empty()) {
+                    added = runStrategy(warped, "perspective+standard", standardPreprocess(warped), allResults);
+                    consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+                    if (consecutiveEmpty < emptyLimit || allResults.isEmpty()) {
+                        added = runStrategy(warped, "perspective", null, allResults);
+                        consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+                    }
+                    warped.release();
+                }
+            }
+
+            // 策略 7:放大 2x + 标准预处理(图小触发;适用条码太小/分辨率不足)
+            if ((consecutiveEmpty < emptyLimit || allResults.isEmpty()) && Math.min(gray.width(), gray.height()) < 400) {
+                Mat big = new Mat();
+                Imgproc.resize(gray, big, new Size(gray.width() * 2, gray.height() * 2),
+                        0, 0, Imgproc.INTER_CUBIC);
+                Mat bigProc = standardPreprocess(big);
+                big.release();
+                added = runStrategy(gray, "2x", bigProc, allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+
+            // 策略 8:放大 3x(图很小触发)
+            if ((consecutiveEmpty < emptyLimit || allResults.isEmpty()) && Math.min(gray.width(), gray.height()) < 200) {
+                Mat big = new Mat();
+                Imgproc.resize(gray, big, new Size(gray.width() * 3, gray.height() * 3),
+                        0, 0, Imgproc.INTER_CUBIC);
+                Mat bigProc = standardPreprocess(big);
+                big.release();
+                added = runStrategy(gray, "3x", bigProc, allResults);
+                consecutiveEmpty = added > 0 ? 0 : consecutiveEmpty + 1;
+            }
+        } finally {
+            gray.release();
+            original.release();
         }
-
-        // ========== 策略 0：透视矫正 + 标准预处理（最优先，解决拍摄倾斜） ==========
-        Mat warped = perspectiveCorrect(gray);
-        if (warped != null && !warped.empty()) {
-            // 矫正后可能仍然模糊/太小，再做标准预处理
-            Mat warpedProcessed = standardPreprocess(warped);
-            tryDecode(warpedProcessed, "perspective+standard", allResults);
-            warpedProcessed.release();
-
-            // 矫正后也尝试直接识别（清晰标签无需额外预处理）
-            tryDecode(warped, "perspective", allResults);
-            warped.release();
-        }
-
-        // ---------- 策略 1：原始灰度 ----------
-        tryDecode(gray, "original", allResults);
-
-        // ---------- 策略 2：标准预处理（去噪+CLAHE+自适应阈值+锐化） ----------
-        // 适用：模糊、低对比度、轻微反光
-        Mat std = standardPreprocess(gray);
-        tryDecode(std, "standard", allResults);
-        std.release();
-
-        // ---------- 策略 3：OTSU 全局阈值 ----------
-        // 适用：光照不均、阴影、强反光导致的局部过曝
-        Mat otsu = otsuPreprocess(gray);
-        tryDecode(otsu, "otsu", allResults);
-        otsu.release();
-
-        // ---------- 策略 4：高锐化 ----------
-        // 适用：运动模糊、打印质量差、条码边缘虚化
-        Mat sharp = sharpenPreprocess(gray);
-        tryDecode(sharp, "sharpen", allResults);
-        sharp.release();
-
-        // ---------- 策略 5：颜色反转 ----------
-        // 适用：反光导致条码黑白反转（白底黑条变成黑底白条）
-        Mat inverted = new Mat();
-        Core.bitwise_not(gray, inverted);
-        tryDecode(inverted, "inverted", allResults);
-        inverted.release();
-
-        // ---------- 策略 6：放大 2x + 标准预处理 ----------
-        // 适用：条码太小、分辨率不足
-        if (Math.min(gray.width(), gray.height()) < 400) {
-            Mat big = new Mat();
-            Imgproc.resize(gray, big, new Size(gray.width() * 2, gray.height() * 2),
-                    0, 0, Imgproc.INTER_CUBIC);
-            Mat bigProc = standardPreprocess(big);
-            tryDecode(bigProc, "2x", allResults);
-            bigProc.release();
-            big.release();
-        }
-
-        // ---------- 策略 7：放大 3x（极小条码） ----------
-        if (Math.min(gray.width(), gray.height()) < 200) {
-            Mat big = new Mat();
-            Imgproc.resize(gray, big, new Size(gray.width() * 3, gray.height() * 3),
-                    0, 0, Imgproc.INTER_CUBIC);
-            Mat bigProc = standardPreprocess(big);
-            tryDecode(bigProc, "3x", allResults);
-            bigProc.release();
-            big.release();
-        }
-
-        gray.release();
-        original.release();
         return allResults;
+    }
+
+    /**
+     * 执行单个识别策略:在预处理后的 Mat 上解码,新增结果到 results。
+     *
+     * @param ownedInput 当 processed 为 null 时的解码输入(由主流程统一释放,本方法不释放)
+     * @param strategy   策略名(用于结果溯源)
+     * @param processed  预处理产物 Mat;非 null 时由本方法释放,为 null 则使用 ownedInput
+     * @param results    累积结果列表(原地新增)
+     * @return 本次策略新增的结果数量
+     */
+    private int runStrategy(Mat ownedInput, String strategy, Mat processed, List<BarcodeResult> results) {
+        int before = results.size();
+        Mat input = processed != null ? processed : ownedInput;
+        tryDecode(input, strategy, results);
+        if (processed != null) {
+            processed.release();
+        }
+        return results.size() - before;
     }
 
     /* ===================== ZXing 解码（含旋转补偿） ===================== */
@@ -625,7 +657,7 @@ public class OpenCVZxingEnhancedScanner implements AutoCloseable {
     /* ===================== 测试入口 ===================== */
 
     public static void main(String[] args) {
-        try (OpenCVZxingEnhancedScanner scanner = new OpenCVZxingEnhancedScanner()) {
+        try (OpenCVZxingQrReader scanner = new OpenCVZxingQrReader()) {
             String path = "";
             try {
                 URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
