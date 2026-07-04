@@ -16,6 +16,7 @@ import org.opencv.core.Mat;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
 import java.io.File;
@@ -31,8 +32,8 @@ import java.util.List;
 public class BoofCvMultiQrReader {
 
     static {
-        // 加载OpenCV本地库
-        OpenCV.loadShared();
+        // 加载OpenCV本地库(Java>=12 不支持 loadShared,直接用 loadLocally)
+        OpenCV.loadLocally();
     }
 
     public static void main(String[] args) {
@@ -134,10 +135,29 @@ public class BoofCvMultiQrReader {
         return binary; // 或返回 deskewed
     }
 
-    // BufferedImage转Mat
+    /**
+     * BufferedImage 转 OpenCV Mat。
+     * <p>
+     * 先统一转为 3 通道 BGR 缓冲图,确保:
+     * 1) 通道数与 CV_8UC3 一致,避免带 alpha 的 4 通道图(如 TYPE_4BYTE_ABGR)
+     *    或单通道灰度图导致 Mat.put 校验通道数时报 UnsupportedOperationException;
+     * 2) 字节序为 BGR,与 OpenCV 默认一致,后续 cvtColor(COLOR_BGR2GRAY) 颜色顺序正确。
+     *
+     * @param bi 源图像,可为任意 BufferedImage 类型
+     * @return CV_8UC3 的 BGR Mat
+     */
     private static Mat bufferedImageToMat(BufferedImage bi) {
-        Mat mat = new Mat(bi.getHeight(), bi.getWidth(), CvType.CV_8UC3);
-        byte[] data = ((DataBufferByte) bi.getRaster().getDataBuffer()).getData();
+        BufferedImage bgr;
+        if (bi.getType() == BufferedImage.TYPE_3BYTE_BGR) {
+            bgr = bi;
+        } else {
+            bgr = new BufferedImage(bi.getWidth(), bi.getHeight(), BufferedImage.TYPE_3BYTE_BGR);
+            Graphics2D graphics = bgr.createGraphics();
+            graphics.drawImage(bi, 0, 0, null);
+            graphics.dispose();
+        }
+        byte[] data = ((DataBufferByte) bgr.getRaster().getDataBuffer()).getData();
+        Mat mat = new Mat(bgr.getHeight(), bgr.getWidth(), CvType.CV_8UC3);
         mat.put(0, 0, data);
         return mat;
     }

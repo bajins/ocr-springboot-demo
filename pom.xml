@@ -18,12 +18,12 @@
     <description>ocr使用示例</description>
 
     <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
+        <maven.compiler.source>25</maven.compiler.source>
+        <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <javacpp.platform>linux-x86_64</javacpp.platform> <!-- 或 windows-x86_64, macosx-x86_64, macosx-arm64 -->
 
-        <smartjavaai.version>1.1.1</smartjavaai.version>
+        <smartjavaai.version>1.1.2</smartjavaai.version>
         <javacv.version>1.5.10</javacv.version>
         <javacv.platform.macosx-arm64>macosx-arm64</javacv.platform.macosx-arm64>
         <javacv.platform.linux-x86_64>linux-x86_64</javacv.platform.linux-x86_64>
@@ -94,7 +94,7 @@
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
-            <version>1.18.30</version>
+            <version>1.18.46</version>
             <scope>provided</scope>
         </dependency>
 

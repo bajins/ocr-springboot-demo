@@ -3,7 +3,6 @@ package com.bajins.ocr.utils;
 import com.google.zxing.*;
 import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 import com.google.zxing.common.HybridBinarizer;
-import com.google.zxing.multi.ByQuadrantReader;
 import com.google.zxing.multi.GenericMultipleBarcodeReader;
 import com.google.zxing.multi.MultipleBarcodeReader;
 
@@ -17,6 +16,7 @@ import java.net.URL;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 
@@ -24,41 +24,49 @@ public class ZXingMultiQrReader {
 
     public static List<String> decodeQrCodes(File imageFile) throws Exception {
         BufferedImage img = ImageIO.read(imageFile);
-        // 适当放大（太密集时很有用）
-        int scale = 2;
-        BufferedImage scaled = new BufferedImage(img.getWidth() * scale, img.getHeight() * scale, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = scaled.createGraphics();
-        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-        g.drawImage(img, 0, 0, scaled.getWidth(), scaled.getHeight(), null);
-        g.dispose();
-        // 灰度 + 简单增强
-        BufferedImage gray = new BufferedImage(scaled.getWidth(), scaled.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+        // scale=1 不放大;若图过于密集可调大,但像素量按 scale² 增长、耗时显著上升
+        final int scale = 1;
+        BufferedImage base = img;
+        if (scale > 1) {
+            base = new BufferedImage(img.getWidth() * scale, img.getHeight() * scale, BufferedImage.TYPE_INT_RGB);
+            Graphics2D scaler = base.createGraphics();
+            scaler.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            scaler.drawImage(img, 0, 0, base.getWidth(), base.getHeight(), null);
+            scaler.dispose();
+        }
+
+        // 转单通道灰度(ZXing 内部再二值化,这里统一通道格式)
+        BufferedImage gray = new BufferedImage(base.getWidth(), base.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
         Graphics2D gGray = gray.createGraphics();
-        gGray.drawImage(scaled, 0, 0, null);
+        gGray.drawImage(base, 0, 0, null);
         gGray.dispose();
 
         LuminanceSource source = new BufferedImageLuminanceSource(gray);
         BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
 
-        // 1. 基础 Reader（支持多种条码/二维码，包括 QR）
-        Reader baseReader = new MultiFormatReader();
+        // GenericMultipleBarcodeReader 自身按已找到码的边界递归切分,支持一维码+二维码多码;
+        // 不再用 ByQuadrantReader(其十字切四象限会切断横向一维码)
+        MultipleBarcodeReader multiReader = new GenericMultipleBarcodeReader(new MultiFormatReader());
 
-        // 2. 如果场景是“一张图里多个 QR 码”，建议用 ByQuadrantReader 包装一下
-        //    官方建议：多个 2D 码时用 ByQuadrantReader，能提高检测率
-        Reader quadrantReader = new ByQuadrantReader(baseReader);
-
-        // 3. 再包装成多码 Reader
-        MultipleBarcodeReader multiReader = new GenericMultipleBarcodeReader(quadrantReader);
-
-        // 4. 设置 hints（TRY_HARDER 对多码场景很有帮助）
+        // hints:保留 TRY_HARDER 提升识别率;标签为黑码白底,去掉 ALSO_INVERTED(反色探测耗时翻倍)
         Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
-        // 如果明确只关心 QR
-//        hints.put(DecodeHintType.POSSIBLE_FORMATS, List.of(BarcodeFormat.QR_CODE));
-        // 如果图是白底黑码，可以试试反色
-        hints.put(DecodeHintType.ALSO_INVERTED, Boolean.TRUE);
+        // 限定支持的格式,避免 MultiFormatReader 盲试全部 ~15 种格式拖慢速度
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, EnumSet.of(
+                BarcodeFormat.QR_CODE,
+                BarcodeFormat.PDF_417,
+                BarcodeFormat.CODE_128,
+                BarcodeFormat.CODE_39,
+                BarcodeFormat.CODE_93,
+                BarcodeFormat.EAN_13,
+                BarcodeFormat.EAN_8,
+                BarcodeFormat.ITF,
+                BarcodeFormat.CODABAR,
+                BarcodeFormat.UPC_A,
+                BarcodeFormat.UPC_E
+        ));
 
-        // 5. 一次性解码所有码
+        // 一次性解码所有码
         Result[] results = multiReader.decodeMultiple(bitmap, hints);
 
         List<String> texts = new ArrayList<>();
@@ -86,7 +94,7 @@ public class ZXingMultiQrReader {
         }
         File file = new File(path); // 你的标签图片
         List<String> qrTexts = decodeQrCodes(file);
-        System.out.println("识别到 " + qrTexts.size() + " 个二维码：");
+        System.out.println("识别到 " + qrTexts.size() + " 个条码：");
         for (String text : qrTexts) {
             System.out.println(text);
         }

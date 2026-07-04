@@ -1,6 +1,7 @@
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.jna.*;
 import com.sun.jna.win32.StdCallLibrary;
+import com.sun.jna.win32.W32APIOptions;
 
 import java.io.File;
 import java.io.IOException;
@@ -9,7 +10,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Scanner;
 
 // https://github.com/PaddleOCRCore/PaddleOCRApi
 public class TestPaddleOCRApi {
@@ -31,8 +31,10 @@ public class TestPaddleOCRApi {
         // 加载 PaddleOCR.dll
         PaddleOCR INSTANCE = loadLibrary(null, PaddleOCR.class);
 
+        boolean SetDllDirectory(String path);
+
         static <T extends Library> T loadLibrary(String libDir, Class<T> clazz) {
-            String libName = "win32-x86-64/";
+            String libName = "paddleocrapi/";
             if (Platform.isMac()) {
                 libName += "PaddleOCR.dylib";
             } else if (Platform.isLinux()) {
@@ -59,7 +61,7 @@ public class TestPaddleOCRApi {
             // 为关键库设置专用路径
             // NativeLibrary.addSearchPath("PaddleOCR", dll.getParent());
             // Windows设置多个库路径，用分号分隔
-            System.setProperty("jna.library.path", dll.getParent());
+            System.setProperty("jna.library.path", dll.getParent() + File.pathSeparator + System.getProperty("jna.library.path", ""));
             if (Platform.isWindows()) {
                 // 设置 Windows DLL 搜索目录（处理依赖）用 Kernel32.SetDllDirectory 扩展搜索路径（Win32 API）
                 // 需要 JNA 的 platform.jar
@@ -71,7 +73,7 @@ public class TestPaddleOCRApi {
             // 在加载 DLL 前，动态添加路径到 java.library.path
         /*String libraryPath = System.getProperty("java.library.path");
         System.setProperty("java.library.path", dll.getParent() + File.pathSeparator + libraryPath);*/
-            return Native.load(dll.getAbsolutePath(), clazz);
+            return Native.load(dll.getAbsolutePath(), clazz, W32APIOptions.UNICODE_OPTIONS);
         }
 
         // 开启/关闭日志
@@ -96,12 +98,18 @@ public class TestPaddleOCRApi {
     public static void main(String[] args) {
         try {
             // 获取当前工作目录
-            String rootDir = System.getProperty("user.dir");
+//            String rootDir = System.getProperty("user.dir");
 
             // 模型路径 (请根据实际存放位置修改)
-            String detModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-OCRv5_server_det_infer";
-            String clsModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-LCNet_x1_0_textline_ori_infer";
-            String recModel = rootDir + "\\model\\ocr\\PaddleOCR\\PP-OCRv5_server_rec_infer";
+//            String detModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv6_tiny_det_infer";
+//            String recModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv6_tiny_rec_infer";
+//            String detModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv6_small_det_infer";
+//            String recModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv6_small_rec_infer";
+            String detModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv5_mobile_det_infer";
+            String recModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv5_mobile_rec_infer";
+//            String detModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv4_mobile_det_infer";
+//            String recModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-OCRv4_mobile_rec_infer";
+            String clsModel = "F:\\workspace\\workspace-a\\PaddleOCRWebApi4.5.2-CPU\\models\\PP-LCNet_x1_0_textline_ori";
 
             // 初始化参数 JSON
             Map<String, Object> ocrParameter = getOCRParameter();
