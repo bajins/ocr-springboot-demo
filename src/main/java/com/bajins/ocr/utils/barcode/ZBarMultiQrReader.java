@@ -1,4 +1,4 @@
-package com.bajins.ocr.utils;
+package com.bajins.ocr.utils.barcode;
 
 import io.github.doblon8.jzbar.*;
 

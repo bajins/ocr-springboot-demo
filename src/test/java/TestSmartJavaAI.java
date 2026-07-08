@@ -16,7 +16,6 @@ import cn.smartjavaai.ocr.factory.OcrModelFactory;
 import cn.smartjavaai.ocr.model.common.detect.OcrCommonDetModel;
 import cn.smartjavaai.ocr.model.common.direction.OcrDirectionModel;
 import cn.smartjavaai.ocr.model.common.recognize.OcrCommonRecModel;
-import com.bajins.ocr.utils.ImageCropAndRotate;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
