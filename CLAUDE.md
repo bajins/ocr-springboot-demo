@@ -38,3 +38,14 @@
 
 ### 构建注意
 - `pom.xml` 配置 `<sourceDirectory>.</sourceDirectory>`，导致 `mvn compile` 会把 `src/test/java` 也纳入主源码编译。校验单个文件编译时，用 `mvn dependency:build-classpath` 生成 classpath 后 `javac` 单独编译目标文件，避开无关测试文件的既有错误。
+
+### 依赖版本管理（pom.xml）
+- 第三方库版本统一抽取到 `<properties>`，按生态分命名空间：
+  - `javacv.*`：`javacv.version`（javacv/javacpp）、`javacv.ffmpeg.version`/`javacv.openblas.version`/`javacv.opencv.version` + `javacv.platform.*`（windows-x86_64/linux-x86_64/linux-arm64/macosx-arm64）
+  - `djl.*`：`djl.pytorch.version`（pytorch-native-cpu）+ `djl.platform.*`（windows-x86_64/linux-x86_64/linux-aarch64/osx-aarch64）
+  - `zxing.version`：zxing core + javase
+  - `boofcv.version`（boofcv-core + boofcv-io）+ `boofcv.visualize.version`（visualize，与主版本不同步，见下）
+- **版本不同步陷阱**：bytedeco 子库版本格式 `<原生库版本>-<JavaCPP版本>`（如 `6.1.1-1.5.10`）与 `javacv.version`（JavaCPP 框架版本）不同步，升级 `javacv.version` 时子库版本不能简单跟随，须按 bytedeco release 兼容矩阵分别核对。boofcv `visualize:0.26` 与 `boofcv-core/io:1.4.0` 不同步且 artifactId 疑似旧版（当前应为 `boofcv-visualization`），升级前须核对是否应统一为 1.4.0。
+- replace_all 替换 `<version>X</version>` 时，精确标签匹配天然隔离子串（如 `2.7.1` 是 `2.7.1-0.34.0` 子串但 `<version>2.7.1</version> ≠ <version>2.7.1-0.34.0</version>`，不会误伤）；但 X 作为独立版本若跨区块共用，须先确认仅目标区块引用。
+- 平台 classifier 用 `${javacv.platform.*}` / `${djl.platform.*}` 变量，按平台保留对应配置以减小包体积。
+- **属性引用悬空校验（强制）**：版本号提取分两步（先加 properties 变量、再 replace_all 替换引用），漏加变量会致 `${var}` 引用悬空而 Maven 不立即报错。完成后必须 grep 每个 `${var}` 确认 properties 中有且仅有一处定义。
