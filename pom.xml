@@ -376,6 +376,7 @@
         </dependency>
         <!-- ========================== tess4j end =========================== -->
 
+        <!-- +++++++++++++++++++++++++++++++++++++ 二维码处理 +++++++++++++++++++++++++++++++++++++ -->
         <!-- Source: https://mvnrepository.com/artifact/com.google.zxing/core -->
         <dependency>
             <groupId>com.google.zxing</groupId>
@@ -388,6 +389,14 @@
             <groupId>com.google.zxing</groupId>
             <artifactId>javase</artifactId>
             <version>${zxing.version}</version>
+            <scope>compile</scope>
+        </dependency>
+
+        <!-- Source: https://mvnrepository.com/artifact/io.github.doblon8/jzbar -->
+        <dependency>
+            <groupId>io.github.doblon8</groupId>
+            <artifactId>jzbar</artifactId>
+            <version>0.4.0</version>
             <scope>compile</scope>
         </dependency>
 
@@ -406,20 +415,12 @@
             <scope>compile</scope>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/org.boofcv/visualize -->
-        <dependency>
+        <!--<dependency>
             <groupId>org.boofcv</groupId>
             <artifactId>visualize</artifactId>
             <version>${boofcv.visualize.version}</version>
             <scope>compile</scope>
-        </dependency>
-
-        <!-- Source: https://mvnrepository.com/artifact/io.github.doblon8/jzbar -->
-        <dependency>
-            <groupId>io.github.doblon8</groupId>
-            <artifactId>jzbar</artifactId>
-            <version>0.4.0</version>
-            <scope>compile</scope>
-        </dependency>
+        </dependency>-->
 
 
         <!-- https://mvnrepository.com/artifact/org.apache.pdfbox/pdfbox-app -->
