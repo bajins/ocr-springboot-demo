@@ -11,20 +11,46 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.CLAHE;
 import org.opencv.imgproc.Imgproc;
 
+import javax.imageio.ImageIO;
+import java.awt.Graphics2D;
 import java.awt.geom.AffineTransform;
 import java.awt.image.AffineTransformOp;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferByte;
 import java.io.File;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.function.Function;
 
 /**
- * OpenCV + ZXing 增强型条码识别器
- * 针对模糊、反光、密集、太小、倾斜标签优化
+ * OpenCV + ZXing 增强型条码识别器（形态学切割 + 单码识别为主，多策略整图兜底）。
+ * <p>
+ * <b>主流程：
+ * 1. 对图片进行预处理：转灰度图 -> 图像二值化（或边缘检测） -> 膨胀操作（把条码的密集像素连成一个个实心的矩形块）。
+ * 2. 调用 `Imgproc.findContours` 找到每一个实心块的边界框（`Rect`）。
+ * 3. 根据这个 `Rect`，把原图上的条码一个个 `crop`（裁剪）下来。
+ * 4. 将这些裁剪好的小图，逐一送给 ZXing 的单码识别 `MultiFormatReader.decode()`。
+ * <p>
+ * ZXing 的 {@code decodeMultiple} 对一整张含几十个码的图很弱（密集码互相干扰、漏扫、相同内容去重失误）。
+ * 故先用 OpenCV 形态学把每个条码/二维码连成"实心块"，裁剪成只含一个码的干净小图，再单码 {@code decode}，
+ * 既不漏又天然携带精确 (x,y) 坐标供分行排序。
+ * <p>
+ * | 步骤         | 操作                                            | 目地                              |
+ * | ---------- | --------------------------------------------- | ------------------------------- |
+ * | **边缘检测**   | `GaussianBlur` + `Canny`                      | 凸显条码/二维码密集的黑白交错边缘              |
+ * | **形态学闭运算** | `MORPH_CLOSE` 方核（核尺寸按短边自适应）                  | 把密集边缘连成实心块：二维码整体成块、一维码竖条聚合     |
+ * | **轮廓定位**   | `findContours` + `boundingRect`               | 拿到每个码的精确外接 Rect (x,y,w,h)      |
+ * | **候选过滤**   | 尺寸/面积比/宽高比过滤 + IOU 合并重叠 + padding 扩边          | 剔除噪点/整图背景/细长条纹，保留 Quiet Zone    |
+ * | **逐块解码**   | 裁剪小图 -> 单码 `decode`（4 角度）-> 失败 `decodeMultiple` 兜底 | 一图一码不漏；粘连多码由多码兜底捕获              |
+ * | **坐标还原**   | 角点反旋转回 0° + 叠加区域偏移                            | 还原到原图坐标系，供跨阶段去重与分行排序            |
+ * <p>
+ * <b>兜底流程：整图多策略 + 透视矫正 + 放大</b>（捕获切割遗漏：粘连二维码、无边缘特征码、切割失败）：
+ * <p>
+ * 切割主流程识别后，仍跑一遍整图多码扫描作为兜底，靠位置去重与切割结果合并。早停机制保证已有结果时快速跳过重策略。
  * <p>
  * | 恶劣条件      | 对应策略                | OpenCV 操作                 | 原理                     |
  * | --------- | ------------------- | ------------------------- | ---------------------- |
@@ -49,9 +75,12 @@ import java.util.function.Function;
  * 设计要点：
  * <ul>
  *   <li>资源所有权：{@code scanInternal} 在 finally 中释放传入的 {@code original} 与内部 {@code gray}；
+ *       形态学切割中间产物由 {@code locateBarcodeRegions} 释放，裁剪 ROI 由 {@code decodeRegions} 释放；
  *       各预处理策略产出的 Mat 由 {@code runStrategy} 释放，基图（gray/warped）由各自的拥有方释放。</li>
- *   <li>线程安全：ZXing {@code GenericMultipleBarcodeReader} 非线程安全，{@link #scanInternal} 以实例锁串行化；
- *       高并发场景请为每个线程创建独立实例，而非放开锁。</li>
+ *   <li>线程安全：ZXing {@code GenericMultipleBarcodeReader} 与 {@code MultiFormatReader} 均非线程安全，
+ *       {@link #scanInternal} 以实例锁串行化；高并发场景请为每个线程创建独立实例，而非放开锁。</li>
+ *   <li>坐标体系统一：切割路径的 {@code rect} 用切割框（精确外框），整图兜底路径用角点包围盒；
+ *       所有 {@code points} 已反旋转 + 叠加偏移回原图坐标系，可直接用于去重与排序。</li>
  * </ul>
  */
 public class OpenCVZxingQrReader implements AutoCloseable {
@@ -100,6 +129,46 @@ public class OpenCVZxingQrReader implements AutoCloseable {
      * 触发 3 倍放大预处理的最小图像短边（px）
      */
     private static final int UPSCALE_3X_MAX = 200;
+    /**
+     * 形态学切割：候选区域最小宽高（px），小于此视为噪点
+     */
+    private static final int MIN_REGION_SIZE = 30;
+    /**
+     * 形态学切割：候选区域占图面积比上限，超过视为整图背景
+     */
+    private static final double MAX_REGION_RATIO = 0.9;
+    /**
+     * 形态学切割：候选区域宽高比下限
+     */
+    private static final double ASPECT_REGION_MIN = 0.15;
+    /**
+     * 形态学切割：候选区域宽高比上限
+     */
+    private static final double ASPECT_REGION_MAX = 15.0;
+    /**
+     * 形态学切割：裁剪扩边（px），保留 Quiet Zone 提升 ZXing 识别率
+     */
+    private static final int REGION_PADDING = 8;
+    /**
+     * 形态学切割：合并重叠候选区域的 IOU 阈值
+     */
+    private static final double MERGE_IOU = 0.3;
+    /**
+     * 形态学核尺寸：短边比例分母，核大小 ≈ minDim / {@value}
+     */
+    private static final int KERNEL_SIZE_DIVISOR = 40;
+    /**
+     * 形态学核尺寸下限（px，奇数）
+     */
+    private static final int KERNEL_MIN = 7;
+    /**
+     * 形态学核尺寸上限（px，奇数）
+     */
+    private static final int KERNEL_MAX = 31;
+    /**
+     * 分行排序：Y 方向最小容差（px），防止极小码容差为 0 导致行错乱
+     */
+    private static final int MIN_ROW_TOLERANCE = 15;
 
     static {
         // 自动加载对应平台的 OpenCV 原生库（无需系统安装）
@@ -118,14 +187,19 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     );
 
     private final MultipleBarcodeReader multiReader;
+    /**
+     * 单码读取器：形态学切割后逐块单码 {@code decode} 使用（一图一码假设，速度快不漏码）
+     */
+    private final MultiFormatReader singleReader;
     private final Map<DecodeHintType, Object> hints;
 
     /**
-     * 构造识别器：初始化 ZXing 多码读取器与解码提示（限定码制 + TRY_HARDER）。
+     * 构造识别器：初始化 ZXing 多码/单码读取器与解码提示（限定码制 + TRY_HARDER）。
      */
     public OpenCVZxingQrReader() {
         MultiFormatReader formatReader = new MultiFormatReader();
         multiReader = new GenericMultipleBarcodeReader(formatReader);
+        singleReader = new MultiFormatReader();
 
         hints = new EnumMap<>(DecodeHintType.class);
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
@@ -148,28 +222,103 @@ public class OpenCVZxingQrReader implements AutoCloseable {
      * 识别图片文件中的所有条码（支持 1D/2D 混合、多码、各种恶劣条件）。
      *
      * @param imageFile 待识别的图片文件
-     * @return 去重后的全部识别结果（可能为空，但不为 null）
+     * @return 去重后的全部识别结果（未排序，可能为空，但不为 null）
      * @throws IOException 图片不存在或无法解码时抛出
      */
     public List<BarcodeResult> scan(File imageFile) throws IOException {
-        Mat src = Imgcodecs.imread(imageFile.getAbsolutePath());
-        if (src.empty()) {
-            src.release();
-            throw new IOException("无法读取图片: " + imageFile.getAbsolutePath());
-        }
+        Mat src = readMat(imageFile);
         // scanInternal 在 finally 中释放 src，调用方无需再释放
         return scanInternal(src);
+    }
+
+    /**
+     * 识别图片文件中的所有条码，并按从上到下、从左到右分行排序返回。
+     *
+     * @param imageFile 待识别的图片文件
+     * @return 去重并按坐标分行排序后的全部识别结果（可能为空，但不为 null）
+     * @throws IOException 图片不存在或无法解码时抛出
+     */
+    public List<BarcodeResult> scanOrdered(File imageFile) throws IOException {
+        return sortByRow(scan(imageFile));
+    }
+
+    /**
+     * 读取图片文件为 Mat（中文路径免疫）。
+     *
+     * <p>OpenCV {@code imread} 在 Windows 下经 C 运行时 {@code fopen}（ANSI 编码）读取路径，含非 ASCII
+     * 字符（如中文）的路径会因编码错配而失败。故先用 Java NIO 读字节再 {@code imdecode} 绕过 native
+     * {@code fopen}；{@code imdecode} 失败（OpenCV 不支持的格式）时用 {@code ImageIO} 兜底转 Mat。
+     *
+     * @param file 图片文件，须存在且可读
+     * @return 解码后的 Mat（由调用方释放）
+     * @throws IOException 图片读取失败
+     */
+    private static Mat readMat(File file) throws IOException {
+        if (!file.isFile()) {
+            throw new IllegalArgumentException("图片文件不存在或不是文件: " + file);
+        }
+        // A: imdecode 优先--绕过 native fopen，免疫中文路径，保留 OpenCV 全格式解码能力
+        byte[] data = Files.readAllBytes(file.toPath());
+        Mat buf = new MatOfByte(data);
+        Mat mat = Imgcodecs.imdecode(buf, Imgcodecs.IMREAD_COLOR);
+        buf.release();
+        if (!mat.empty()) {
+            return mat;
+        }
+        mat.release();
+        // B: ImageIO 兜底--OpenCV imdecode 不支持的格式（如部分 CMYK JPEG），由 ImageIO 解码后转 Mat
+        BufferedImage bi = ImageIO.read(file);
+        if (bi == null) {
+            throw new IOException("无法读取图片(格式不支持或文件损坏): " + file);
+        }
+        return bufferedToMat(bi);
+    }
+
+    /**
+     * 将 BufferedImage 转为 OpenCV Mat（8UC3 BGR）。
+     * <p>统一绘制到 3BYTE_BGR 缓冲图后取 raster 原始字节，字节序恰为 BGR，与 OpenCV 8UC3 一致。
+     *
+     * @param img 原始图像，可为任意颜色类型
+     * @return 8UC3 BGR Mat（由调用方释放）
+     */
+    private static Mat bufferedToMat(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        BufferedImage bgr;
+        if (img.getType() == BufferedImage.TYPE_3BYTE_BGR) {
+            bgr = img;
+        } else {
+            // 非 3BYTE_BGR 先统一绘制到 3BYTE_BGR，保证字节序为 BGR
+            bgr = new BufferedImage(w, h, BufferedImage.TYPE_3BYTE_BGR);
+            Graphics2D g = bgr.createGraphics();
+            g.drawImage(img, 0, 0, null);
+            g.dispose();
+        }
+        byte[] pixels = ((DataBufferByte) bgr.getRaster().getDataBuffer()).getData();
+        Mat mat = new Mat(h, w, CvType.CV_8UC3);
+        mat.put(0, 0, pixels);
+        return mat;
     }
 
     /**
      * 直接识别 OpenCV Mat。内部克隆保护原图，调用方后续需自行释放传入的 Mat。
      *
      * @param src 待识别的 Mat（不会被修改，由调用方负责释放）
-     * @return 去重后的全部识别结果（可能为空，但不为 null）
+     * @return 去重后的全部识别结果（未排序，可能为空，但不为 null）
      */
     public List<BarcodeResult> scan(Mat src) {
         // 克隆一份：scanInternal 会释放传入的 Mat，故隔离以保护调用方的原图
         return scanInternal(src.clone());
+    }
+
+    /**
+     * 直接识别 OpenCV Mat，并按从上到下、从左到右分行排序返回。
+     *
+     * @param src 待识别的 Mat（不会被修改，由调用方负责释放）
+     * @return 去重并按坐标分行排序后的全部识别结果（可能为空，但不为 null）
+     */
+    public List<BarcodeResult> scanOrdered(Mat src) {
+        return sortByRow(scan(src));
     }
 
     @Override
@@ -178,17 +327,19 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
-     * 核心识别管道：在灰度图上依次执行多套预处理策略，每策略做 4 角度旋转补偿解码，
-     * 命中后早停以避免不必要的重策略开销，所有策略结果去重后汇总返回。
-     * <p>实例锁串行化，保护非线程安全的 {@code multiReader}。
+     * 核心识别管道：阶段一形态学切割逐块单码识别（主流程）+ 阶段二整图多策略兜底。
+     * <p>阶段一用 OpenCV 形态学把每个码连成实心块，裁剪后单码 decode，拿精确坐标；
+     * 阶段二在灰度图上依次执行多套预处理策略（每策略 4 角度旋转补偿），命中后早停，
+     * 捕获切割遗漏的码。两阶段结果按位置去重后汇总返回。
+     * <p>实例锁串行化，保护非线程安全的 {@code multiReader} 与 {@code singleReader}。
      *
      * @param original 源图像 Mat（由本方法在 finally 中释放，调用方无需再释放）
-     * @return 去重后的全部识别结果（可能为空，但不为 null）
+     * @return 去重后的全部识别结果（未排序，可能为空，但不为 null）
      */
     private synchronized List<BarcodeResult> scanInternal(Mat original) {
         List<BarcodeResult> allResults = new ArrayList<>();
 
-        // 统一转灰度作为所有策略的输入
+        // 统一转灰度作为切割检测、裁剪与所有策略的输入
         Mat gray = new Mat();
         try {
             if (original.channels() == 3 || original.channels() == 4) {
@@ -197,11 +348,15 @@ public class OpenCVZxingQrReader implements AutoCloseable {
                 original.copyTo(gray);
             }
 
+            // 阶段一：形态学切割 + 逐块单码识别（主流程，拿精确坐标）
+            List<Rect> regions = locateBarcodeRegions(gray);
+            decodeRegions(gray, regions, allResults);
+
             /*
-             * 策略按"轻 -> 重"排序：典型标签在前几个轻量策略即可命中，命中后早停避免重策略。
+             * 阶段二：整图多策略兜底（捕获切割遗漏：粘连二维码、无边缘特征码、切割失败）。
              * 早停：已识别到码 且 连续 EMPTY_LIMIT 个策略无新增 -> 跳过后续重策略（透视矫正/放大）。
-             * 若一个码都没识别到（allResults 为空），即使连续无新增也继续尝试救命策略，
-             * 避免倾斜/极小标签因前几个增强策略未命中而被漏识。
+             * 阶段一已产出结果时，阶段二通常前几个轻量策略即可早停；若阶段一空手而归（allResults 为空），
+             * 即便连续无新增也继续尝试救命策略，避免倾斜/极小标签因前几个增强策略未命中而被漏识。
              */
             int consecutiveEmpty = 0;
             int minDim = Math.min(gray.width(), gray.height());
@@ -290,7 +445,8 @@ public class OpenCVZxingQrReader implements AutoCloseable {
         int before = results.size();
         Mat input = processed != null ? processed : ownedInput;
         try {
-            tryDecode(input, strategy, results);
+            // 整图兜底：bounds=null 表示无区域偏移，rect 用角点包围盒
+            tryDecode(input, strategy, null, results);
         } finally {
             // processed 由本策略创建，无论解码成功或抛异常都必须释放；ownedInput 由主流程释放
             if (processed != null) {
@@ -298,6 +454,245 @@ public class OpenCVZxingQrReader implements AutoCloseable {
             }
         }
         return results.size() - before;
+    }
+
+    /**
+     * 形态学切割定位条码候选区域：Canny 边缘 -> 方核闭运算连块 -> 轮廓过滤 -> IOU 合并 -> 扩边。
+     * <p>方核对二维码（整体成块）与一维码（竖条聚合）均适用；核尺寸按图像短边自适应，避免固定尺寸
+     * 在不同分辨率下粘连（核过大）或连不上（核过小）。
+     *
+     * @param gray 输入灰度图
+     * @return 候选区域 Rect 列表（已合并重叠、扩边，原图坐标系）
+     */
+    private static List<Rect> locateBarcodeRegions(Mat gray) {
+        List<Rect> regions = new ArrayList<>();
+        Mat blurred = new Mat();
+        Mat edges = new Mat();
+        Mat closed = new Mat();
+        Mat hierarchy = new Mat();
+        Mat kernel = null;
+        List<MatOfPoint> contours = new ArrayList<>();
+        try {
+            // 轻度高斯降噪，让 Canny 边缘更连续
+            Imgproc.GaussianBlur(gray, blurred, new Size(3, 3), 0);
+            // Canny 边缘检测：凸显条码/二维码密集的黑白交错边缘
+            Imgproc.Canny(blurred, edges, 50, 150);
+            // 方核闭运算：把密集边缘连成实心块（二维码整体成块、一维码竖条聚合）
+            int k = adaptiveKernelSize(gray);
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(k, k));
+            Imgproc.morphologyEx(edges, closed, Imgproc.MORPH_CLOSE, kernel);
+            // 查找最外层轮廓，压缩水平/垂直/对角线段以减少点数
+            Imgproc.findContours(closed, contours, hierarchy,
+                    Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            double imgArea = gray.cols() * (double) gray.rows();
+            Size size = gray.size();
+            for (MatOfPoint contour : contours) {
+                Rect r = Imgproc.boundingRect(contour);
+                // 过滤噪点（过小）、整图背景（过大）、异常宽高比（细长条纹/图像边界）
+                if (r.width < MIN_REGION_SIZE || r.height < MIN_REGION_SIZE) {
+                    continue;
+                }
+                if (r.width * (double) r.height > imgArea * MAX_REGION_RATIO) {
+                    continue;
+                }
+                double aspect = r.width / (double) r.height;
+                if (aspect < ASPECT_REGION_MIN || aspect > ASPECT_REGION_MAX) {
+                    continue;
+                }
+                regions.add(padRect(r, size));
+            }
+        } finally {
+            // 中间产物无论成功或异常都释放，避免 native 内存泄漏
+            blurred.release();
+            edges.release();
+            closed.release();
+            hierarchy.release();
+            if (kernel != null) {
+                kernel.release();
+            }
+            for (MatOfPoint c : contours) {
+                c.release();
+            }
+        }
+        // 合并高度重叠的候选区，避免同一物理码被多轮廓重复框选
+        return mergeOverlappingRegions(regions);
+    }
+
+    /**
+     * 形态学核尺寸自适应：按图像短边比例缩放，限制在 [{@value #KERNEL_MIN}, {@value #KERNEL_MAX}] 且为奇数。
+     *
+     * @param gray 输入灰度图
+     * @return 奇数核尺寸（px）
+     */
+    private static int adaptiveKernelSize(Mat gray) {
+        int minDim = Math.min(gray.width(), gray.height());
+        int k = minDim / KERNEL_SIZE_DIVISOR;
+        // 强制奇数：形态学核标准做法，保证明确的中心点
+        if (k % 2 == 0) {
+            k++;
+        }
+        return Math.max(KERNEL_MIN, Math.min(KERNEL_MAX, k));
+    }
+
+    /**
+     * 对候选 Rect 向外扩边（保留 Quiet Zone），并裁剪到图像边界内。
+     *
+     * @param r         原始候选矩形
+     * @param imageSize 原图尺寸
+     * @return 扩边并边界裁剪后的 Rect
+     */
+    private static Rect padRect(Rect r, Size imageSize) {
+        int x = Math.max(0, r.x - REGION_PADDING);
+        int y = Math.max(0, r.y - REGION_PADDING);
+        // 宽高基于已 clamp 的 x/y 计算，保证不越界
+        int w = Math.min((int) imageSize.width - x, r.width + 2 * REGION_PADDING);
+        int h = Math.min((int) imageSize.height - y, r.height + 2 * REGION_PADDING);
+        return new Rect(x, y, w, h);
+    }
+
+    /**
+     * 合并高度重叠的候选矩形：IOU 超过 {@value #MERGE_IOU} 的合并为外接矩形。
+     * <p>同一物理条码可能被多个轮廓框选，合并后避免重复解码。
+     *
+     * @param regions 待合并的候选矩形列表
+     * @return 合并后的矩形列表（新建列表）
+     */
+    private static List<Rect> mergeOverlappingRegions(List<Rect> regions) {
+        if (regions.size() <= 1) {
+            return new ArrayList<>(regions);
+        }
+        List<Rect> merged = new ArrayList<>();
+        // 标记已合并的矩形，避免重复处理
+        boolean[] used = new boolean[regions.size()];
+        for (int i = 0; i < regions.size(); i++) {
+            if (used[i]) {
+                continue;
+            }
+            Rect current = regions.get(i);
+            used[i] = true;
+            for (int j = i + 1; j < regions.size(); j++) {
+                if (used[j]) {
+                    continue;
+                }
+                Rect other = regions.get(j);
+                if (iou(current, other) > MERGE_IOU) {
+                    // 合并为两矩形的外接矩形
+                    int x = Math.min(current.x, other.x);
+                    int y = Math.min(current.y, other.y);
+                    int w = Math.max(current.x + current.width, other.x + other.width) - x;
+                    int h = Math.max(current.y + current.height, other.y + other.height) - y;
+                    current = new Rect(x, y, w, h);
+                    used[j] = true;
+                }
+            }
+            merged.add(current);
+        }
+        return merged;
+    }
+
+    /**
+     * 计算两矩形的 IOU（交并比）。
+     *
+     * @param a 第一矩形
+     * @param b 第二矩形
+     * @return IOU 值 [0,1]；无重叠返回 0
+     */
+    private static double iou(Rect a, Rect b) {
+        int intersectX = Math.max(a.x, b.x);
+        int intersectY = Math.max(a.y, b.y);
+        int intersectW = Math.min(a.x + a.width, b.x + b.width) - intersectX;
+        int intersectH = Math.min(a.y + a.height, b.y + b.height) - intersectY;
+        // 无交集直接返回 0
+        if (intersectW <= 0 || intersectH <= 0) {
+            return 0.0;
+        }
+        double intersectArea = intersectW * (double) intersectH;
+        // 并集面积 = 两矩形面积之和 - 交集面积（扣除重复计算的交集部分）
+        double unionArea = a.width * (double) a.height + b.width * (double) b.height - intersectArea;
+        return unionArea > 0 ? intersectArea / unionArea : 0.0;
+    }
+
+    /**
+     * 遍历候选区域，从灰度图裁剪后逐块解码，结果（坐标已还原到原图）累积到 results。
+     *
+     * @param gray    灰度原图（裁剪源，由调用方释放）
+     * @param regions 候选区域列表（原图坐标系）
+     * @param results 累积结果列表（原地新增）
+     */
+    private void decodeRegions(Mat gray, List<Rect> regions, List<BarcodeResult> results) {
+        for (Rect region : regions) {
+            // 从灰度图裁剪候选区（ROI 共享数据，用完释放视图不影响原图）
+            Mat crop = new Mat(gray, region);
+            try {
+                decodeCrop(crop, region, results);
+            } finally {
+                crop.release();
+            }
+        }
+    }
+
+    /**
+     * 单个候选区域解码：优先单码 {@code decode}（一图一码假设，快且不漏），失败再 {@code decodeMultiple} 兜底。
+     * <p>粘连多码（切割未完全分离）时单码 decode 只取首个，剩余由 decodeMultiple 捕获；
+     * 切割遗漏的码则由阶段二整图兜底补齐。
+     *
+     * @param crop    裁剪出的小图 Mat（灰度，由调用方释放）
+     * @param region  该区域在原图中的 Rect（用于坐标偏移与结果 rect）
+     * @param results 累积结果列表（原地新增）
+     */
+    private void decodeCrop(Mat crop, Rect region, List<BarcodeResult> results) {
+        // 优先单码 decode：一图一码假设下速度快
+        tryDecodeSingle(crop, "morphcrop", region, results);
+        // 继续 decodeMultiple 兜底：形态学闭运算可能把多个码连成一个块，
+        // 单码只取首个会漏掉同块内其他码（如 QR+DM 粘连），用多码兜底补齐（去重过滤重复）
+        tryDecode(crop, "morphcrop-multi", region, results);
+    }
+
+    /**
+     * 单码解码：对裁剪小图做 0°/90°/180°/270° 旋转尝试，命中首个即返回。
+     * <p>坐标反旋转回 0° 后叠加区域偏移还原到原图坐标系；{@code rect} 用角点包围盒（即使块粘连也保证各码位置独立）。
+     *
+     * @param mat      裁剪小图 Mat（灰度）
+     * @param strategy 策略名（用于结果溯源）
+     * @param bounds   该区域在原图中的 Rect（非 null，用于坐标偏移）
+     * @param results  累积结果列表（原地新增）
+     * @return 命中返回 true，全角度未识别返回 false
+     */
+    private boolean tryDecodeSingle(Mat mat, String strategy, Rect bounds, List<BarcodeResult> results) {
+        BufferedImage image = matToBufferedImage(mat);
+        if (image == null) {
+            return false;
+        }
+        int offsetX = bounds.x;
+        int offsetY = bounds.y;
+        for (int angle = 0; angle < 360; angle += 90) {
+            BufferedImage rotated = rotateImage(image, angle);
+            try {
+                BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(rotated)));
+                // reset 防止上一次 decode 的内部状态影响本次（MultiFormatReader 非线程安全，已由实例锁串行）
+                singleReader.reset();
+                Result r = singleReader.decode(bitmap, hints);
+                // 将旋转后图像的坐标统一反旋转回小图 0° 坐标系，再叠加区域偏移到原图坐标系
+                ResultPoint[] localPoints = unrotatePoints(r.getResultPoints(),
+                        rotated.getWidth(), rotated.getHeight(), angle);
+                ResultPoint[] origPoints = offsetPoints(localPoints, offsetX, offsetY);
+                if (!isDuplicate(r.getText(), r.getBarcodeFormat().toString(), origPoints, results)) {
+                    results.add(new BarcodeResult(
+                            r.getText(),
+                            r.getBarcodeFormat().toString(),
+                            origPoints,
+                            pointsToRect(origPoints),
+                            strategy,
+                            angle
+                    ));
+                }
+                return true; // 单码命中即返回（继续由 decodeMultiple 补齐同块其他码）
+            } catch (NotFoundException ignored) {
+                // 该角度未识别到单码，继续尝试下一角度
+            }
+        }
+        return false;
     }
 
     /**
@@ -471,32 +866,41 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
-     * 对给定图像尝试 0°/90°/180°/270° 识别，新增结果到 results（含跨角度去重）。
+     * 对给定图像尝试 0°/90°/180°/270° 多码识别，新增结果到 results（含跨角度去重）。
+     * <p>{@code bounds} 非 null 时为切割路径（坐标叠加区域偏移）；为 null 时为整图兜底路径（无偏移）。
+     * 每个码的 {@code rect} 统一用角点包围盒，即使形态学粘连成一个大块也能保证各码位置独立。
      *
      * @param mat      待解码的 Mat（灰度或预处理产物）
      * @param strategy 策略名（用于结果溯源）
+     * @param bounds   区域 Rect（切割路径）或 null（整图兜底路径）
      * @param results  累积结果列表（原地新增）
      */
-    private void tryDecode(Mat mat, String strategy, List<BarcodeResult> results) {
+    private void tryDecode(Mat mat, String strategy, Rect bounds, List<BarcodeResult> results) {
         BufferedImage image = matToBufferedImage(mat);
         if (image == null) {
             return;
         }
+        int offsetX = bounds != null ? bounds.x : 0;
+        int offsetY = bounds != null ? bounds.y : 0;
         // 一维码对旋转敏感，尝试 0°、90°、180°、270°
         for (int angle = 0; angle < 360; angle += 90) {
             BufferedImage rotated = rotateImage(image, angle);
             try {
                 Result[] found = decodeBarcodes(rotated);
                 for (Result r : found) {
-                    // 将旋转后图像的坐标统一反旋转回原始图坐标系
-                    ResultPoint[] originalPoints = unrotatePoints(
+                    // 将旋转后图像的坐标统一反旋转回 0° 坐标系，再叠加区域偏移到原图坐标系
+                    ResultPoint[] localPoints = unrotatePoints(
                             r.getResultPoints(), rotated.getWidth(), rotated.getHeight(), angle);
+                    ResultPoint[] origPoints = offsetPoints(localPoints, offsetX, offsetY);
                     if (!isDuplicate(r.getText(), r.getBarcodeFormat().toString(),
-                            originalPoints, results)) {
+                            origPoints, results)) {
+                        // 用角点包围盒作为每个码的精确 rect；即使形态学粘连成一个大块，
+                        // 各码的 ResultPoint 仍给出独立位置，保证排序精度
                         results.add(new BarcodeResult(
                                 r.getText(),
                                 r.getBarcodeFormat().toString(),
-                                originalPoints,
+                                origPoints,
+                                pointsToRect(origPoints),
                                 strategy,
                                 angle
                         ));
@@ -516,7 +920,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
      *
      * @param text     新结果的条码内容
      * @param type     新结果的码制
-     * @param points   新结果的角点（原始图坐标系）
+     * @param points   新结果的角点（原图坐标系）
      * @param existing 已有结果列表
      * @return 重复返回 true，否则 false
      */
@@ -526,7 +930,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
             if (!old.type().equals(type) || !old.data().equals(text)) {
                 continue;
             }
-            // 计算两个结果在原始图坐标系下的中心点距离
+            // 计算两个结果在原图坐标系下的中心点距离
             double dist = centerDistance(points, old.points());
             // 阈值取旧结果包围盒对角线的 50%，最小 20px，若距离小于阈值则判定为同一码
             double threshold = boundingBoxDiagonal(old.points()) * DUP_DIST_RATIO;
@@ -538,7 +942,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
-     * 计算两组点在原始图坐标系下的中心点距离。
+     * 计算两组点在原图坐标系下的中心点距离。
      *
      * @param points1 第一组点
      * @param points2 第二组点
@@ -565,7 +969,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
-     * 将旋转后图像上的坐标反旋转回原始图坐标系。
+     * 将旋转后图像上的坐标反旋转回 0° 坐标系。
      * 旋转逻辑与 {@link #rotateImage} 对应：
      * <ul>
      *   <li>0°：不变</li>
@@ -578,7 +982,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
      * @param rotW   旋转后图像宽度
      * @param rotH   旋转后图像高度
      * @param angle  旋转角度
-     * @return 原始图坐标系下的点数组
+     * @return 0° 坐标系下的点数组
      */
     private static ResultPoint[] unrotatePoints(ResultPoint[] points, int rotW, int rotH, int angle) {
         if (angle == 0) {
@@ -614,7 +1018,7 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
-     * 计算 ResultPoint 包围盒的对角线长度。
+     * 计算每组 ResultPoint 包围盒的对角线长度。
      *
      * @param points 点数组
      * @return 包围盒对角线长度
@@ -629,6 +1033,51 @@ public class OpenCVZxingQrReader implements AutoCloseable {
             maxY = Math.max(maxY, p.getY());
         }
         return Math.sqrt(Math.pow(maxX - minX, 2) + Math.pow(maxY - minY, 2));
+    }
+
+    /**
+     * 将局部坐标点叠加区域偏移，还原到原图坐标系。偏移为 0 时直接返回原数组（零拷贝）。
+     *
+     * @param points  局部坐标点（小图 0° 坐标系）
+     * @param offsetX 区域 X 偏移
+     * @param offsetY 区域 Y 偏移
+     * @return 原图坐标系下的点数组
+     */
+    private static ResultPoint[] offsetPoints(ResultPoint[] points, int offsetX, int offsetY) {
+        if (offsetX == 0 && offsetY == 0) {
+            return points;
+        }
+        ResultPoint[] result = new ResultPoint[points.length];
+        for (int i = 0; i < points.length; i++) {
+            result[i] = new ResultPoint(points[i].getX() + offsetX, points[i].getY() + offsetY);
+        }
+        return result;
+    }
+
+    /**
+     * 由 ResultPoint 角点计算外接 Rect（用于整图兜底路径无切割框时的 rect）。
+     *
+     * @param points 角点数组（原图坐标系）
+     * @return 外接 Rect；空数组返回零尺寸 Rect
+     */
+    private static Rect pointsToRect(ResultPoint[] points) {
+        if (points == null || points.length == 0) {
+            return new Rect(0, 0, 0, 0);
+        }
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
+        double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        for (ResultPoint p : points) {
+            minX = Math.min(minX, p.getX());
+            minY = Math.min(minY, p.getY());
+            maxX = Math.max(maxX, p.getX());
+            maxY = Math.max(maxY, p.getY());
+        }
+        int x = Math.max(0, (int) minX);
+        int y = Math.max(0, (int) minY);
+        // 宽高至少 1，避免零尺寸 Rect 影响后续排序容差计算
+        int w = Math.max(1, (int) (maxX - minX));
+        int h = Math.max(1, (int) (maxY - minY));
+        return new Rect(x, y, w, h);
     }
 
     /**
@@ -826,6 +1275,27 @@ public class OpenCVZxingQrReader implements AutoCloseable {
     }
 
     /**
+     * 按从上到下、从左到右对结果分行排序：同一行（Y 容差内）按 X 排序，不同行按 Y 排序。
+     * <p>Y 容差取两者高度一半与 {@value #MIN_ROW_TOLERANCE} 的较大值，避免微小高度差或极小码导致行错乱。
+     *
+     * @param results 待排序结果列表（不修改原列表）
+     * @return 排序后的新列表
+     */
+    public static List<BarcodeResult> sortByRow(List<BarcodeResult> results) {
+        List<BarcodeResult> sorted = new ArrayList<>(results);
+        sorted.sort((a, b) -> {
+            int yDiff = a.rect.y - b.rect.y;
+            // 同一行判定：Y 差小于容差则按 X 排，否则按 Y 排
+            int tolerance = Math.max(Math.max(a.rect.height, b.rect.height) / 2, MIN_ROW_TOLERANCE);
+            if (Math.abs(yDiff) < tolerance) {
+                return a.rect.x - b.rect.x;
+            }
+            return yDiff;
+        });
+        return sorted;
+    }
+
+    /**
      * 单个识别策略描述：名称 + 预处理函数 + 附加启用条件。
      *
      * @param name       策略名（用于结果溯源）
@@ -846,20 +1316,29 @@ public class OpenCVZxingQrReader implements AutoCloseable {
      *
      * @param data     条码内容文本
      * @param type     码制（如 QR_CODE、CODE_128）
-     * @param points   条码角点坐标（已统一回原始图坐标系）
-     * @param strategy 命中时所用的预处理策略名
+     * @param points   条码角点坐标（已统一回原图坐标系）
+     * @param rect     条码外接矩形（切割路径为切割框，整图兜底路径为角点包围盒；原图坐标系）
+     * @param strategy 命中所用的预处理策略名
      * @param angle    命中时的旋转角度（0/90/180/270）
      */
-    public record BarcodeResult(String data, String type, ResultPoint[] points, String strategy, int angle) {
+    public record BarcodeResult(String data, String type, ResultPoint[] points, Rect rect,
+                                String strategy, int angle) {
+        public BarcodeResult {
+            // 防御性拷贝：points 来自解码中间结果，拷贝后与外部隔离（ResultPoint 不可变，浅拷贝即安全）
+            points = points == null ? new ResultPoint[0] : points.clone();
+            rect = rect == null ? new Rect(0, 0, 0, 0) : rect;
+        }
+
         @Override
         public String toString() {
-            return String.format("[%s] %s (strategy=%s, angle=%d°)", type, data, strategy, angle);
+            return String.format("[%s] %s (strategy=%s, angle=%d°, rect=[%d,%d %dx%d])",
+                    type, data, strategy, angle, rect.x, rect.y, rect.width, rect.height);
         }
     }
 
     public static void main(String[] args) {
         // 从 classpath 加载示例图片
-        URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
+        /*URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
         if (url == null) {
             System.err.println("未找到资源 images/2026-05-05_163050.png");
             return;
@@ -871,10 +1350,15 @@ public class OpenCVZxingQrReader implements AutoCloseable {
         } catch (URISyntaxException e) {
             System.err.println("资源 URI 解析失败: " + e.getMessage());
             return;
-        }
+        }*/
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        File file = new File("F:\\workspace\\workspace-a\\盘料图片\\2026-07-15_093400_979.png");
         try (OpenCVZxingQrReader scanner = new OpenCVZxingQrReader()) {
-            List<BarcodeResult> results = scanner.scan(new File(path));
-            System.out.println("共识别到 " + results.size() + " 个唯一条码：");
+            List<BarcodeResult> results = scanner.scanOrdered(file);
+            System.out.println("共识别到 " + results.size() + " 个唯一条码（已按从上到下、从左到右排序）：");
             results.forEach(System.out::println);
         } catch (Exception e) {
             e.printStackTrace();

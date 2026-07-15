@@ -146,7 +146,11 @@ public class BoofCvMultiQrReader {
     }
 
     public static void main(String[] args) {
-        List<QrCode> detections = detect("F:\\workspace\\workspace-a\\2026-05-05_163050.png");
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        List<QrCode> detections = detect("F:\\workspace\\workspace-a\\盘料图片\\2026-07-15_111031.png");
         System.out.println("共识别到 " + detections.size() + " 个二维码：");
         for (QrCode qr : detections) {
             System.out.println("  内容: " + qr.message);

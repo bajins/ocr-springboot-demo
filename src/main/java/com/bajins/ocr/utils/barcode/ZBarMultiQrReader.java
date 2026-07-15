@@ -35,6 +35,16 @@ import java.util.List;
  *   <li>jzbar 原生库缺失抛 UnsatisfiedLinkError(系统异常，不封装)，需确保运行环境含对应平台库。</li>
  * </ul>
  *
+ * <p>SQ Code 一种非常冷门的安全二维条码，几乎见不到，ZBar 支持。
+ * <p>ISBN (图书码)	ISBN10 / ISBN13	重点：其实 ISBN 底层就是 EAN-13 格式。ZXing 扫出来只会告诉你这是 EAN_13；而 ZBar 帮你做了一层解析，直接识别出这是图书 ISBN 码。
+ * <p>Composite 复合条码（一维码+二维码叠在一起），ZBar 专门分了一类。
+ * <p>PARTIAL	ZBar内部状态，表示只扫到了一部分，不是独立的条码格式。
+ * <p>
+ * <p>ZBar 不支持：
+ * <p>Data Matrix 工业、电子元件常用。
+ * <p>Aztec 常见于各种交通票务（如火车票、登机牌）。
+ * <p>MaxiCode 核心是中间有个类似“牛眼”的同心圆，主要由 UPS 快递使用。
+ *
  * <p>依赖：io.github.doblon8:jzbar:0.4.0
  * <p>参考：https://github.com/doblon8/jzbar
  */
@@ -401,7 +411,11 @@ public class ZBarMultiQrReader {
     }
 
     public static void main(String[] args) {
-        List<Barcode> results = detect("F:\\workspace\\workspace-a\\2026-05-05_163050.png");
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        List<Barcode> results = detect("F:\\workspace\\workspace-a\\盘料图片\\20260714185759_158_160.jpg");
         System.out.println("共识别到 " + results.size() + " 个条码：");
         for (Barcode barcode : results) {
             System.out.println("----------------------");

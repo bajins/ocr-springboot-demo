@@ -11,7 +11,6 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
-import java.net.URL;
 import java.util.*;
 import java.util.List;
 
@@ -24,8 +23,9 @@ import java.util.List;
  *       无持久句柄与模型加载，采用无状态静态方法，天然线程安全，对齐同目录 BoofCvMultiQrReader 风格。</li>
  *   <li>结果封装：ZXing Result 虽为纯 Java 对象不依赖 native，但仍拷贝到 {@link Barcode} record，
  *       统一 API、屏蔽 ZXing 类型细节，与同包 ZBarMultiQrReader 保持一致。</li>
- *   <li>多码识别：GenericMultipleBarcodeReader 按已找到码的边界递归切分图像，支持一维+二维多码；
- *       不使用 ByQuadrantReader(其十字切四象限会切断横向一维码)。</li>
+ *   <li>多码识别：逐格式独立扫描--对每个启用格式单独跑一次 GenericMultipleBarcodeReader(完整原图)，使递归切分
+ *       只围绕该格式展开，避免全格式混合时先找到的码(通常 QR)按其边界切分破坏 DATA_MATRIX 的 L 形定位角致漏识别；
+ *       跨格式天然不重复(ZXing 不会将一码误识为另一格式)；不使用 ByQuadrantReader(其十字切四象限会切断横向一维码)。</li>
  *   <li>配置隔离：{@link Options} 持有启用的格式集合(BarcodeFormat 枚举，不可变)、TRY_HARDER 开关与
  *       放大倍数，提供 defaultConfig/qrOnly/linearOnly 预设与 of/plus/tryHarder/scale 自定义能力。</li>
  *   <li>输入预处理：转 8 位灰度后交 ZXing 内部 HybridBinarizer 二值化；可选 scale 放大(像素量按 scale² 增长)。</li>
@@ -38,6 +38,11 @@ import java.util.List;
  *   <li>未识别到任何条码(NotFoundException)视为正常情况，返回空列表，不抛异常。</li>
  * </ul>
  *
+ * <p>ZBar 不支持：
+ * <p>Data Matrix 工业、电子元件常用。
+ * <p>Aztec 常见于各种交通票务（如火车票、登机牌）。
+ * <p>MaxiCode 核心是中间有个类似“牛眼”的同心圆，主要由 UPS 快递使用。
+ *
  * <p>依赖：com.google.zxing:core + javase
  * <p>参考：https://github.com/zxing/zxing
  */
@@ -47,7 +52,7 @@ public class ZXingMultiQrReader {
      * 默认启用的条码格式：常用一维码 + 二维码
      */
     private static final Set<BarcodeFormat> DEFAULT_FORMATS = Set.of(
-            BarcodeFormat.QR_CODE, BarcodeFormat.PDF_417,
+            BarcodeFormat.QR_CODE, BarcodeFormat.PDF_417, BarcodeFormat.DATA_MATRIX,
             BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.CODE_93,
             BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.ITF,
             BarcodeFormat.CODABAR, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E);
@@ -160,7 +165,12 @@ public class ZXingMultiQrReader {
     }
 
     /**
-     * 执行一次完整扫描：放大 -> 转灰度 -> 二值化 -> 多码解码 -> 收集结果。
+     * 执行一次完整扫描：放大 -> 转灰度 -> 二值化 -> 逐格式多码解码 -> 合并结果。
+     *
+     * <p>逐格式独立扫描：对每个启用格式单独跑一次 {@link GenericMultipleBarcodeReader}(完整原图)，
+     * 使递归切分只围绕该格式展开。全格式混合时先找到的码(通常 QR)会按其边界切分图像，易破坏
+     * DATA_MATRIX 的 L 形定位角导致漏识别；拆分后每种格式在完整原图独立检测，彻底规避此问题。
+     * 跨格式天然不重复(ZXing 不会将一码误识为另一格式)，同格式内 multi reader 自身去重，故合并无需额外去重。
      *
      * @param image   源图像，已非空校验
      * @param options 识别配置，已非空校验
@@ -172,44 +182,134 @@ public class ZXingMultiQrReader {
         // 转单通道灰度(ZXing 内部再二值化，这里统一通道格式)
         BufferedImage gray = toGray(scaled);
 
-        LuminanceSource source = new BufferedImageLuminanceSource(gray);
-        BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-        // GenericMultipleBarcodeReader 按已找到码的边界递归切分，支持一维码+二维码多码
-        MultipleBarcodeReader multiReader = new GenericMultipleBarcodeReader(new MultiFormatReader());
+        // 完整原图位图复用：GenericMultipleBarcodeReader 递归切分时对子区域 crop 生成新位图，不改原图，可安全多次 decode
+        BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(gray)));
 
-        try {
-            Result[] results = multiReader.decodeMultiple(bitmap, buildHints(options));
-            // Result 为纯 Java 对象，拷贝到 record 统一 API、屏蔽 ZXing 类型
-            List<Barcode> barcodes = new ArrayList<>(results.length);
-            for (Result result : results) {
-                ResultPoint[] points = result.getResultPoints();
-                barcodes.add(new Barcode(
-                        result.getText(),
-                        result.getBarcodeFormat(),
-                        categorizeBarcodeType(result.getBarcodeFormat()),
-                        points == null ? List.of() : List.of(points)));
+        // 逐格式独立 multi 扫描后合并；图中无该格式时快速 NotFoundException 返回，实际开销可控
+        List<Barcode> barcodes = new ArrayList<>();
+        for (BarcodeFormat format : options.formats()) {
+            List<Result> results = decodeMultipleForFormat(bitmap, format, options.tryHarder());
+            // DATA_MATRIX 整图检测常因 WhiteRectangleDetector 受复杂背景干扰而失败，
+            // 整图未命中时降级为滑动窗口网格扫描(每子图单独检测，等价手工剪切)，避免漏识别
+            if (format == BarcodeFormat.DATA_MATRIX && results.isEmpty()) {
+                results = gridScanDataMatrix(gray, options.tryHarder());
             }
-            return barcodes;
+            for (Result result : results) {
+                // Result 为纯 Java 对象，拷贝到 record 统一 API、屏蔽 ZXing 类型
+                barcodes.add(toBarcode(result));
+            }
+        }
+        return barcodes;
+    }
+
+    /**
+     * 对单个格式在完整原图上做多码递归扫描。
+     *
+     * <p>POSSIBLE_FORMATS 仅含该格式，使 {@link GenericMultipleBarcodeReader} 的递归切分围绕该格式展开，
+     * 避免多格式混合时先找到的码(通常 QR)按其边界切分、破坏其他格式(如 DATA_MATRIX 的 L 形定位角)。
+     *
+     * @param bitmap    完整原图已二值化位图，可被多次 decode 复用
+     * @param format    本次唯一启用的条码格式
+     * @param tryHarder 是否开启 TRY_HARDER(提升识别率，略增耗时)
+     * @return 该格式识别到的结果列表(可能为空，但不为 null)
+     */
+    private static List<Result> decodeMultipleForFormat(BinaryBitmap bitmap, BarcodeFormat format, boolean tryHarder) {
+        Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        if (tryHarder) {
+            hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+        }
+        // 限定单一格式，既避免 MultiFormatReader 盲试全部格式拖慢，又保证递归切分围绕该格式
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, EnumSet.of(format));
+        try {
+            // MultiFormatReader 无状态，每次独立创建；GenericMultipleBarcodeReader 按已找到码边界递归切分
+            MultipleBarcodeReader multiReader = new GenericMultipleBarcodeReader(new MultiFormatReader());
+            Result[] results = multiReader.decodeMultiple(bitmap, hints);
+            return Arrays.asList(results);
         } catch (NotFoundException e) {
-            // 未识别到任何条码属正常情况，返回空列表
+            // 图中无该格式条码属正常情况
             return List.of();
         }
     }
 
     /**
-     * 构建 ZXing 解码 hints：TRY_HARDER 提升识别率；POSSIBLE_FORMATS 限定格式避免盲试拖慢。
+     * 将 ZXing {@link Result} 拷贝为不可变 {@link Barcode}，屏蔽 ZXing 类型细节、统一 API。
      *
-     * @param options 识别配置，提供 tryHarder 开关与格式集合
-     * @return ZXing hints 映射
+     * @param result ZXing 识别结果，非 null
+     * @return 拷贝后的条码记录
      */
-    private static Map<DecodeHintType, Object> buildHints(Options options) {
-        Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
-        if (options.tryHarder()) {
-            hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+    private static Barcode toBarcode(Result result) {
+        ResultPoint[] points = result.getResultPoints();
+        return new Barcode(
+                result.getText(),
+                result.getBarcodeFormat(),
+                categorizeBarcodeType(result.getBarcodeFormat()),
+                points == null ? List.of() : List.of(points));
+    }
+
+    /** 网格扫描子图边长：过大趋近整图(仍受背景干扰)，过小易切断 DM；700 经实测命中 */
+    private static final int GRID_TILE = 700;
+    /** 网格扫描步长：tile/2 即 50% 重叠，保证 DM 至少被一个完整子图覆盖 */
+    private static final int GRID_STEP = GRID_TILE / 2;
+
+    /**
+     * DATA_MATRIX 滑动窗口网格扫描：将整图切成重叠子图，每子图单独 multi 解码。
+     *
+     * <p>整图场景下 ZXing {@code DataMatrixReader} 的 {@code WhiteRectangleDetector} 常因复杂背景干扰
+     * 定位不到 DM 白边致漏识别；切到仅含 DM 的子图(背景单纯)即可识别，等价于手工剪切。
+     * 跨子图可能重复命中同一 DM，按文本去重；位置点经 {@link #translateResult} 修正回全图坐标。
+     *
+     * @param gray      完整灰度图(已放大)，网格在其上切分
+     * @param tryHarder 是否开启 TRY_HARDER
+     * @return 去重后的 DM 结果列表(可能为空，但不为 null)
+     */
+    private static List<Result> gridScanDataMatrix(BufferedImage gray, boolean tryHarder) {
+        int width = gray.getWidth();
+        int height = gray.getHeight();
+        // 图不大于一个 tile 时网格退化为整图(整图已失败)，无意义，直接返回空避免无谓扫描
+        if (width <= GRID_TILE && height <= GRID_TILE) {
+            return List.of();
         }
-        // 限定支持格式，避免 MultiFormatReader 盲试全部 ~15 种格式拖慢速度
-        hints.put(DecodeHintType.POSSIBLE_FORMATS, EnumSet.copyOf(options.formats()));
-        return hints;
+        Set<String> seenTexts = new HashSet<>();
+        List<Result> results = new ArrayList<>();
+        for (int y = 0; y < height; y += GRID_STEP) {
+            for (int x = 0; x < width; x += GRID_STEP) {
+                int w = Math.min(GRID_TILE, width - x);
+                int h = Math.min(GRID_TILE, height - y);
+                // 子图过小(图边缘残余)不足以容纳 DM，跳过
+                if (w < 100 || h < 100) {
+                    continue;
+                }
+                BufferedImage sub = gray.getSubimage(x, y, w, h);
+                BinaryBitmap subBitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(sub)));
+                for (Result result : decodeMultipleForFormat(subBitmap, BarcodeFormat.DATA_MATRIX, tryHarder)) {
+                    // 跨子图可能重复命中同一 DM，按文本去重
+                    if (seenTexts.add(result.getText())) {
+                        results.add(translateResult(result, x, y));
+                    }
+                }
+            }
+        }
+        return results;
+    }
+
+    /**
+     * 将子图内识别结果的定位点坐标平移回全图坐标。
+     *
+     * @param result  子图内识别结果，非 null
+     * @param offsetX 子图在整图中的 x 偏移
+     * @param offsetY 子图在整图中的 y 偏移
+     * @return 定位点已平移的新 Result(文本/格式不变)
+     */
+    private static Result translateResult(Result result, int offsetX, int offsetY) {
+        ResultPoint[] points = result.getResultPoints();
+        if (points != null) {
+            ResultPoint[] shifted = new ResultPoint[points.length];
+            for (int i = 0; i < points.length; i++) {
+                shifted[i] = new ResultPoint(points[i].getX() + offsetX, points[i].getY() + offsetY);
+            }
+            points = shifted;
+        }
+        return new Result(result.getText(), result.getRawBytes(), points, result.getBarcodeFormat());
     }
 
     /**
@@ -331,7 +431,7 @@ public class ZXingMultiQrReader {
          * @return 仅二维码配置
          */
         public static Options qrOnly() {
-            return new Options(Set.of(BarcodeFormat.QR_CODE, BarcodeFormat.PDF_417), true, 1);
+            return new Options(Set.of(BarcodeFormat.QR_CODE, BarcodeFormat.PDF_417, BarcodeFormat.DATA_MATRIX), true, 1);
         }
 
         /**
@@ -430,11 +530,16 @@ public class ZXingMultiQrReader {
 
     public static void main(String[] args) throws Exception {
         // 从 classpath 读取示例图片(可改为任意 File 路径)
-        URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
+        /*URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
         if (url == null) {
             throw new IllegalArgumentException("未找到示例图片资源 images/2026-05-05_163050.png");
         }
-        File file = new File(url.toURI());
+        File file = new File(url.toURI());*/
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        File file = new File("F:\\workspace\\workspace-a\\盘料图片\\20260714184754_156_160.jpg");
 
         List<Barcode> results = detect(file);
         System.out.println("共识别到 " + results.size() + " 个条码：");

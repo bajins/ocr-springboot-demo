@@ -6,7 +6,9 @@ import com.google.zxing.common.HybridBinarizer;
 import com.google.zxing.multi.GenericMultipleBarcodeReader;
 import com.google.zxing.multi.MultipleBarcodeReader;
 import nu.pattern.OpenCV;
+import org.opencv.core.CvType;
 import org.opencv.core.Mat;
+import org.opencv.core.MatOfByte;
 import org.opencv.core.MatOfPoint;
 import org.opencv.core.Rect;
 import org.opencv.core.Size;
@@ -14,8 +16,12 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 
 import javax.imageio.ImageIO;
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferByte;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.util.*;
 
 /**
@@ -102,6 +108,64 @@ public class OcvZxingQrReader {
     }
 
     /**
+     * 读取图片文件为 Mat（中文路径免疫）。
+     *
+     * <p>OpenCV {@code imread} 在 Windows 下经 C 运行时 {@code fopen}（ANSI 编码）读取路径，含非 ASCII
+     * 字符（如中文）的路径会因编码错配而失败。故先用 Java NIO 读字节再 {@code imdecode} 绕过 native
+     * {@code fopen}；{@code imdecode} 失败（OpenCV 不支持的格式）时用 {@code ImageIO} 兜底转 Mat。
+     *
+     * @param file 图片文件，须存在且可读
+     * @return 解码后的 Mat（由调用方释放）
+     * @throws IOException 图片读取失败
+     */
+    private static Mat readMat(File file) throws IOException {
+        if (!file.isFile()) {
+            throw new IllegalArgumentException("图片文件不存在或不是文件: " + file);
+        }
+        // A: imdecode 优先--绕过 native fopen，免疫中文路径，保留 OpenCV 全格式解码能力
+        byte[] data = Files.readAllBytes(file.toPath());
+        Mat buf = new MatOfByte(data);
+        Mat mat = Imgcodecs.imdecode(buf, Imgcodecs.IMREAD_COLOR);
+        buf.release();
+        if (!mat.empty()) {
+            return mat;
+        }
+        mat.release();
+        // B: ImageIO 兜底--OpenCV imdecode 不支持的格式（如部分 CMYK JPEG），由 ImageIO 解码后转 Mat
+        BufferedImage bi = ImageIO.read(file);
+        if (bi == null) {
+            throw new IOException("无法读取图片(格式不支持或文件损坏): " + file);
+        }
+        return bufferedToMat(bi);
+    }
+
+    /**
+     * 将 BufferedImage 转为 OpenCV Mat（8UC3 BGR）。
+     * <p>统一绘制到 3BYTE_BGR 缓冲图后取 raster 原始字节，字节序恰为 BGR，与 OpenCV 8UC3 一致。
+     *
+     * @param img 原始图像，可为任意颜色类型
+     * @return 8UC3 BGR Mat（由调用方释放）
+     */
+    private static Mat bufferedToMat(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        BufferedImage bgr;
+        if (img.getType() == BufferedImage.TYPE_3BYTE_BGR) {
+            bgr = img;
+        } else {
+            // 非 3BYTE_BGR 先统一绘制到 3BYTE_BGR，保证字节序为 BGR
+            bgr = new BufferedImage(w, h, BufferedImage.TYPE_3BYTE_BGR);
+            Graphics2D g = bgr.createGraphics();
+            g.drawImage(img, 0, 0, null);
+            g.dispose();
+        }
+        byte[] pixels = ((DataBufferByte) bgr.getRaster().getDataBuffer()).getData();
+        Mat mat = new Mat(h, w, CvType.CV_8UC3);
+        mat.put(0, 0, pixels);
+        return mat;
+    }
+
+    /**
      * 主识别方法：执行完整识别流程并按从上到下、从左到右排序返回结果。
      * <p>流程：读取图 -> 预处理 -> 候选区域定位 -> 分区解码 -> 全局兜底 -> 合并去重 -> 排序。
      *
@@ -110,10 +174,7 @@ public class OcvZxingQrReader {
      * @throws Exception 图片读取失败或解码过程中发生 I/O 错误时抛出
      */
     public static List<BarcodeResult> scanOrdered(String imagePath) throws Exception {
-        Mat image = Imgcodecs.imread(imagePath);
-        if (image.empty()) {
-            throw new RuntimeException("无法读取图片: " + imagePath);
-        }
+        Mat image = readMat(new File(imagePath));
 
         // 1. 图像预处理 - 增强条码对比度
         Mat gray = new Mat();
@@ -407,7 +468,11 @@ public class OcvZxingQrReader {
      * @throws Exception 识别过程中发生异常时抛出
      */
     public static void main(String[] args) throws Exception {
-        List<BarcodeResult> results = scanOrdered("F:\\workspace\\workspace-a\\2026-05-05_163050.png");
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        List<BarcodeResult> results = scanOrdered("F:\\workspace\\workspace-a\\盘料图片\\20260714185759_158_160.jpg");
 
         System.out.println("识别到 " + results.size() + " 个条码（已按从上到下、从左到右排序）：");
         for (int i = 0; i < results.size(); i++) {

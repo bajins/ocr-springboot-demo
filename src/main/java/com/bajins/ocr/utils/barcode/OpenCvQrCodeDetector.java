@@ -3,6 +3,7 @@ package com.bajins.ocr.utils.barcode;
 import nu.pattern.OpenCV;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
+import org.opencv.core.MatOfByte;
 import org.opencv.core.Point;
 import org.opencv.core.Size;
 import org.opencv.imgcodecs.Imgcodecs;
@@ -11,12 +12,15 @@ import org.opencv.objdetect.GraphicalCodeDetector;
 import org.opencv.objdetect.QRCodeDetector;
 import org.opencv.objdetect.QRCodeDetectorAruco;
 
+import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
 import java.io.File;
+import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -533,7 +537,11 @@ public class OpenCvQrCodeDetector {
     }
 
     /**
-     * 用 OpenCV 原生读取图片文件为 Mat。
+     * 读取图片文件为 Mat（中文路径免疫）。
+     *
+     * <p>OpenCV {@code imread} 在 Windows 下经 C 运行时 {@code fopen}（ANSI 编码）读取路径，含非 ASCII
+     * 字符（如中文）的路径会因编码错配而失败。故先用 Java NIO 读字节再 {@code imdecode} 绕过 native
+     * {@code fopen}；{@code imdecode} 失败（OpenCV 不支持的格式）时用 {@code ImageIO} 兜底转 Mat。
      *
      * @param file 图片文件，须存在且可读
      * @return 解码后的 Mat（由调用方释放）
@@ -544,12 +552,26 @@ public class OpenCvQrCodeDetector {
         if (!file.isFile()) {
             throw new IllegalArgumentException("图片文件不存在或不是文件: " + file);
         }
-        Mat mat = Imgcodecs.imread(file.getAbsolutePath());
-        if (mat.empty()) {
+        try {
+            // A: imdecode 优先--绕过 native fopen，免疫中文路径，保留 OpenCV 全格式解码能力
+            byte[] data = Files.readAllBytes(file.toPath());
+            Mat buf = new MatOfByte(data);
+            Mat mat = Imgcodecs.imdecode(buf, Imgcodecs.IMREAD_COLOR);
+            buf.release();
+            if (!mat.empty()) {
+                return mat;
+            }
             mat.release();
-            throw new IllegalStateException("无法读取图片(格式不支持或文件损坏): " + file);
+            // B: ImageIO 兜底--OpenCV imdecode 不支持的格式（如部分 CMYK JPEG），由 ImageIO 解码后转 Mat
+            BufferedImage bi = ImageIO.read(file);
+            if (bi != null) {
+                return bufferedToMat(bi);
+            }
+        } catch (IOException e) {
+            // I/O 失败转为 IllegalStateException，保持公开 API 不抛 checked 异常（原语义：读取失败）
+            throw new IllegalStateException("无法读取图片(格式不支持或文件损坏): " + file, e);
         }
-        return mat;
+        throw new IllegalStateException("无法读取图片(格式不支持或文件损坏): " + file);
     }
 
     /**
@@ -671,11 +693,16 @@ public class OpenCvQrCodeDetector {
      * @throws URISyntaxException 示例资源 URI 解析失败
      */
     public static void main(String[] args) throws URISyntaxException {
-        URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
+        /*URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
         if (url == null) {
             throw new IllegalArgumentException("未找到示例图片资源 images/2026-05-05_163050.png");
         }
-        File file = new File(url.toURI());
+        File file = new File(url.toURI());*/
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        File file = new File("F:\\workspace\\workspace-a\\盘料图片\\20260714185759_158_160.jpg");
 
         System.out.println("==== 标准检测器 (QRCodeDetector) ====");
         printResults(detect(file));

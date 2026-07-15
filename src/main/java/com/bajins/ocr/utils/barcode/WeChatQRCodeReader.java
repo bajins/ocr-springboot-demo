@@ -4,12 +4,14 @@ import org.bytedeco.javacpp.BytePointer;
 import org.bytedeco.javacpp.FloatPointer;
 import org.bytedeco.javacpp.Loader;
 import org.bytedeco.javacv.Java2DFrameUtils;
+import org.bytedeco.opencv.global.opencv_core;
 import org.bytedeco.opencv.global.opencv_imgcodecs;
 import org.bytedeco.opencv.opencv_core.Mat;
 import org.bytedeco.opencv.opencv_core.MatVector;
 import org.bytedeco.opencv.opencv_core.StringVector;
 import org.bytedeco.opencv.opencv_wechat_qrcode.WeChatQRCode;
 
+import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
@@ -155,18 +157,43 @@ public class WeChatQRCodeReader implements AutoCloseable {
         if (!file.isFile()) {
             throw new IllegalArgumentException("图片文件不存在或不是文件: " + file);
         }
-        Mat img = opencv_imgcodecs.imread(file.getAbsolutePath());
+        try (Mat img = readMat(file)) {
+            return scan(img);
+        }
+    }
+
+    /**
+     * 读取图片文件为 bytedeco Mat（中文路径免疫）。
+     *
+     * <p>OpenCV {@code imread} 在 Windows 下经 C 运行时 {@code fopen}（ANSI 编码）读取文件路径，
+     * 含非 ASCII 字符（如中文）的路径会因编码错配而打开失败。故本方法先用 Java NIO 读字节再
+     * {@code imdecode} 解码，绕过 native {@code fopen}；{@code imdecode} 失败（OpenCV 不支持的格式）
+     * 时用 {@code ImageIO} 兜底转 Mat，兼顾中文路径与格式兼容。
+     *
+     * @param file 图片文件，须存在且可读
+     * @return 解码后的 Mat（由调用方 close）
+     * @throws IOException 图片读取失败（格式不支持或文件损坏）
+     */
+    private Mat readMat(File file) throws IOException {
+        byte[] data = Files.readAllBytes(file.toPath());
+        // A: imdecode 优先——绕过 native fopen，免疫中文路径，保留 OpenCV 全格式解码能力
+        Mat img;
+        try (BytePointer bp = new BytePointer(data);
+             Mat buf = new Mat(1, data.length, opencv_core.CV_8UC1, bp)) {
+            img = opencv_imgcodecs.imdecode(buf, opencv_imgcodecs.IMREAD_COLOR);
+        }
         if (img == null || img.empty()) {
             if (img != null) {
                 img.close();
             }
-            throw new IOException("无法读取图片(格式不支持或文件损坏): " + file);
+            // B: ImageIO 兜底——OpenCV imdecode 不支持的格式（如部分 CMYK JPEG），由 ImageIO 解码后转 Mat
+            BufferedImage bi = ImageIO.read(file);
+            if (bi == null) {
+                throw new IOException("无法读取图片(格式不支持或文件损坏): " + file);
+            }
+            return Java2DFrameUtils.toMat(bi);
         }
-        try {
-            return scan(img);
-        } finally {
-            img.close();
-        }
+        return img;
     }
 
     /**
@@ -412,11 +439,16 @@ public class WeChatQRCodeReader implements AutoCloseable {
      * @throws IOException        模型加载或图片读取失败
      */
     public static void main(String[] args) throws URISyntaxException, IOException {
-        URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
+        /*URL url = Thread.currentThread().getContextClassLoader().getResource("images/2026-05-05_163050.png");
         if (url == null) {
             throw new IllegalArgumentException("未找到示例图片资源 images/2026-05-05_163050.png");
         }
-        File file = new File(url.toURI());
+        File file = new File(url.toURI());*/
+        // F:\workspace\workspace-a\盘料图片\20260714185759_158_160.jpg
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_111031.png
+        // F:\workspace\workspace-a\盘料图片\2026-07-15_093400_979.png
+        // F:\workspace\workspace-a\盘料图片\20260714184754_156_160.jpg
+        File file = new File("F:\\workspace\\workspace-a\\盘料图片\\20260714185759_158_160.jpg");
 
         try (WeChatQRCodeReader reader = new WeChatQRCodeReader()) {
             List<Barcode> results = reader.detect(file);
